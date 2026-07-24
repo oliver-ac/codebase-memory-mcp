@@ -812,7 +812,8 @@ static const char *verilog_import_types[] = {"extends", "import", "package_impor
                                              NULL};
 static const char *verilog_module_types[] = {"source_file", NULL};
 static const char *verilog_call_types[] = {"system_tf_call", "subroutine_call",
-                                           "function_subroutine_call", "method_call", NULL};
+                                           "function_subroutine_call", "method_call",
+                                           "module_instantiation", NULL};
 static const char *verilog_branch_types[] = {"conditional_statement", "case_statement",
                                              "loop_statement", NULL};
 static const char *verilog_var_types[] = {"net_declaration", "data_declaration", NULL};
@@ -1412,7 +1413,7 @@ static const char *systemverilog_class_types[] = {"class_declaration",
                                                   "type_declaration",
                                                   NULL};
 static const char *systemverilog_call_types[] = {"function_subroutine_call", "system_tf_call",
-                                                 "method_call", NULL};
+                                                 "method_call", "module_instantiation", NULL};
 static const char *systemverilog_import_types[] = {
     "package_import_declaration", "extends",  "import",     "include",
     "include_statement",          "instance", "use_clause", NULL};

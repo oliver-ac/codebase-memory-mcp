@@ -831,8 +831,14 @@ static char *first_leaf_identifier(CBMArena *a, TSNode node, const char *source)
 // subroutine_call -> tf_call -> [hierarchical_identifier ->] simple_identifier.
 // Descend to the first identifier leaf to name the callee.
 static char *extract_hdl_callee(CBMArena *a, TSNode node, const char *source, const char *nk) {
+    // module_instantiation models a structural dependency (module A instantiates
+    // module B); cbm has no dedicated INSTANTIATES edge, so surface it as a CALLS
+    // edge from the enclosing scope to the instantiated module. The module type
+    // name is the instantiation's first identifier (`module_identifier` precedes
+    // the optional parameter_value_assignment and the hierarchical_instance).
     if (strcmp(nk, "function_subroutine_call") != 0 && strcmp(nk, "subroutine_call") != 0 &&
-        strcmp(nk, "tf_call") != 0 && strcmp(nk, "system_tf_call") != 0) {
+        strcmp(nk, "tf_call") != 0 && strcmp(nk, "system_tf_call") != 0 &&
+        strcmp(nk, "module_instantiation") != 0) {
         return NULL;
     }
     return first_leaf_identifier(a, node, source);

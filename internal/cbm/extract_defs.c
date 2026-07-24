@@ -3887,6 +3887,32 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
     }
     const char *label = class_label_for_kind(kind);
 
+    // SystemVerilog/Verilog: class_label_for_kind() collapses package and
+    // typedef declarations to "Class". Refine them to accurate, schema-valid
+    // labels so the graph/UI distinguishes a package namespace and a type from a
+    // class. Note: `module_declaration` is intentionally LEFT as "Class" — in
+    // cbm's ontology "Module" is a file/namespace container (source_file), not a
+    // first-class definition (the grammar_code_extracts_defs heuristic and the
+    // type-resolution path both treat "Class" as the def-with-members role that a
+    // SV module fills: it owns params, nets, sub-instances and methods). A real
+    // SV/UVM `class` also stays "Class"; `interface_declaration` already maps to
+    // "Interface".
+    //   package_declaration -> "Package" (a namespace container, not a type)
+    //   type_declaration    -> "Struct" when it aliases a packed struct/union,
+    //                          else "Type"
+    // Struct/Type stay type-like (cbm_label_is_type_like) so typedef references
+    // resolve. Distinguishing module-vs-class (both "Class") is better done with
+    // a construct sub-kind property than by overloading the container "Module"
+    // label — deferred as a follow-up.
+    if (ctx->language == CBM_LANG_SYSTEMVERILOG || ctx->language == CBM_LANG_VERILOG) {
+        if (strcmp(kind, "package_declaration") == 0) {
+            label = "Package";
+        } else if (strcmp(kind, "type_declaration") == 0) {
+            TSNode su = find_first_descendant_by_kind(node, "struct_union", CBM_DESCENDANT_MAX_DEPTH);
+            label = ts_node_is_null(su) ? "Type" : "Struct";
+        }
+    }
+
     // Sway/WGSL: label struct defs as "Struct" and Sway `abi` blocks as
     // "Interface". Scoped to these grammar-only languages so established
     // struct-as-"Class" labeling (C++/Cap'n Proto …) and the downstream

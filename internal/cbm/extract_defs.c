@@ -6827,6 +6827,32 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
     free(s.data);
 }
 
+// SystemVerilog/Verilog: parameters and localparams are named compile-time
+// constants scoped to a module / package / interface. The generic variable pass
+// only walks top-level file children (params are nested inside these scopes) and
+// systemverilog_var_types matched the `parameter`/`localparam` KEYWORD tokens,
+// not declaration nodes — so params were dropped entirely. Walk the whole tree
+// and emit one Variable per parameter name. `param_assignment` is the uniform
+// name-bearing node for every parameter form (body `parameter_declaration` /
+// `local_parameter_declaration` and ANSI header `parameter_port_declaration`),
+// each holding the parameter's `simple_identifier` name followed by its value
+// expression, so keying on it captures all forms without wrapper-specific logic.
+static void extract_sv_parameters(CBMExtractCtx *ctx, TSNode node) {
+    if (strcmp(ts_node_type(node), "param_assignment") == 0) {
+        // First identifier in pre-order is the parameter name; the value
+        // expression (which may reference other identifiers) follows it.
+        TSNode nm = find_first_descendant_by_kind(node, "simple_identifier", CBM_DESCENDANT_MAX_DEPTH);
+        if (!ts_node_is_null(nm)) {
+            push_var_def(ctx, cbm_node_text(ctx->arena, nm, ctx->source), node);
+        }
+        return;
+    }
+    uint32_t n = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < n; i++) {
+        extract_sv_parameters(ctx, ts_node_named_child(node, i));
+    }
+}
+
 void cbm_extract_definitions(CBMExtractCtx *ctx) {
     const CBMLangSpec *spec = cbm_lang_spec(ctx->language);
     if (!spec) {
@@ -6853,4 +6879,10 @@ void cbm_extract_definitions(CBMExtractCtx *ctx) {
 
     // Extract module-level variables
     extract_variables(ctx, ctx->root, spec);
+
+    // SystemVerilog/Verilog: capture nested parameters/localparams (see
+    // extract_sv_parameters) — the generic passes above cannot reach them.
+    if (ctx->language == CBM_LANG_SYSTEMVERILOG || ctx->language == CBM_LANG_VERILOG) {
+        extract_sv_parameters(ctx, ctx->root);
+    }
 }

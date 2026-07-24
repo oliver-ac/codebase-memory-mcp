@@ -3908,8 +3908,19 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
         if (strcmp(kind, "package_declaration") == 0) {
             label = "Package";
         } else if (strcmp(kind, "type_declaration") == 0) {
-            TSNode su = find_first_descendant_by_kind(node, "struct_union", CBM_DESCENDANT_MAX_DEPTH);
-            label = ts_node_is_null(su) ? "Type" : "Struct";
+            // Refine the typedef's underlying type. Check struct/union first: a
+            // struct that embeds an enum field carries both markers, and it is a
+            // Struct. `enum_name_declaration` (an enum member) is the reliable
+            // marker of an enum typedef. Everything else (scalar/vector aliases,
+            // unresolved types) is a plain "Type".
+            if (!ts_node_is_null(find_first_descendant_by_kind(node, "struct_union", CBM_DESCENDANT_MAX_DEPTH))) {
+                label = "Struct";
+            } else if (!ts_node_is_null(
+                           find_first_descendant_by_kind(node, "enum_name_declaration", CBM_DESCENDANT_MAX_DEPTH))) {
+                label = "Enum";
+            } else {
+                label = "Type";
+            }
         }
     }
 

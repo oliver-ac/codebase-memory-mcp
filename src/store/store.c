@@ -142,6 +142,14 @@ struct cbm_store {
     sqlite3_stmt *stmt_get_file_hashes;
     sqlite3_stmt *stmt_delete_file_hash;
     sqlite3_stmt *stmt_delete_file_hashes;
+
+    /* Node-annotation read path. Cached because the query layer consults them
+     * per node per property miss: preparing each time would dominate the cost
+     * of what is otherwise one index seek. */
+    sqlite3_stmt *stmt_ann_exists;
+    sqlite3_stmt *stmt_ann_probe;
+    sqlite3_stmt *stmt_ann_prop;
+    sqlite3_stmt *stmt_ann_merged;
 };
 
 /* ── Helpers ────────────────────────────────────────────────────── */
@@ -301,6 +309,21 @@ static int init_schema(cbm_store_t *s) {
         "  ignored_files_total INTEGER NOT NULL DEFAULT 0,"
         "  coverage_version INTEGER NOT NULL DEFAULT 1,"
         "  hash_records_complete INTEGER NOT NULL DEFAULT 0"
+        ");"
+        /* External per-node metadata, keyed by the node's qualified_name — the
+         * one node identifier that is STABLE across re-index (node ids are
+         * AUTOINCREMENT and change on every rebuild). Deliberately a SIDE table
+         * rather than extra `nodes` columns: annotations come from outside the
+         * indexer (a language server, an elaborator, a profiler), they are
+         * namespaced per `source` so several annotators coexist, and a rebuild
+         * of the graph must not drop them. Rows whose qualified_name matches no
+         * node are harmless — they simply never join. */
+        "CREATE TABLE IF NOT EXISTS node_annotations ("
+        "  qualified_name TEXT NOT NULL,"
+        "  source TEXT NOT NULL,"
+        "  props TEXT NOT NULL DEFAULT '{}',"
+        "  updated_at TEXT NOT NULL DEFAULT '',"
+        "  PRIMARY KEY (qualified_name, source)"
         ");";
 
     int rc = exec_sql(s, ddl);
@@ -1006,6 +1029,11 @@ void cbm_store_close(cbm_store_t *s) {
     finalize_stmt(&s->stmt_get_file_hashes);
     finalize_stmt(&s->stmt_delete_file_hash);
     finalize_stmt(&s->stmt_delete_file_hashes);
+
+    finalize_stmt(&s->stmt_ann_exists);
+    finalize_stmt(&s->stmt_ann_probe);
+    finalize_stmt(&s->stmt_ann_prop);
+    finalize_stmt(&s->stmt_ann_merged);
 
     /* Use sqlite3_close_v2 — auto-deallocates when last statement finalizes.
      * Prevents ASan false-positive leaks from sqlite3 internal state. */
@@ -7282,6 +7310,434 @@ void cbm_store_adr_free(cbm_adr_t *adr) {
     safe_str_free(&adr->created_at);
     safe_str_free(&adr->updated_at);
     memset(adr, 0, sizeof(*adr));
+}
+
+/* ── Node annotations (external per-node metadata) ─────────────── */
+
+/* node_annotations is created by init_schema, which query-mode opens skip — so
+ * a DB written by an older build has no such table and every statement against
+ * it would fail to prepare. Probe sqlite_master and treat a missing table as
+ * "no annotations" rather than an error.
+ *
+ * The probe statement is cached but the ANSWER is not: a read-only handle is
+ * cached for a whole session, during which another process may import
+ * annotations for the first time and create the table. Re-stepping a cached
+ * statement picks that up (SQLite re-prepares on a schema change) while costing
+ * a reset+step instead of a prepare per call. */
+static bool annotations_table_exists(cbm_store_t *s) {
+    if (!s || !s->db) {
+        return false;
+    }
+    if (!s->stmt_ann_exists) {
+        if (sqlite3_prepare_v2(s->db,
+                               "SELECT 1 FROM sqlite_master WHERE type='table' "
+                               "AND name='node_annotations'",
+                               CBM_NOT_FOUND, &s->stmt_ann_exists, NULL) != SQLITE_OK) {
+            s->stmt_ann_exists = NULL;
+            return false;
+        }
+    }
+    sqlite3_reset(s->stmt_ann_exists);
+    return sqlite3_step(s->stmt_ann_exists) == SQLITE_ROW;
+}
+
+int cbm_store_annotations_upsert(cbm_store_t *s, const char *project,
+                                 const cbm_annotation_t *rows, int count, int *out_matched) {
+    if (out_matched) {
+        *out_matched = 0;
+    }
+    if (!s || !s->db || count < 0) {
+        return CBM_STORE_ERR;
+    }
+    /* Zero rows is a legitimate call, not an error: it is how a caller clears a
+     * source (delete, then upsert nothing). Checked before `rows`, which may
+     * legitimately be NULL when there is nothing to write. */
+    if (count == 0) {
+        return CBM_STORE_OK;
+    }
+    if (!rows) {
+        return CBM_STORE_ERR;
+    }
+    /* A writable handle runs init_schema on open, so the table is there. Guard
+     * anyway: a read-only handle must fail loudly, not silently drop the import. */
+    if (!annotations_table_exists(s)) {
+        store_set_error(s, "node_annotations table missing (store opened read-only?)");
+        return CBM_STORE_ERR;
+    }
+
+    char now[CBM_SZ_32];
+    iso_now(now, sizeof(now));
+
+    const char *sql = "INSERT INTO node_annotations (qualified_name, source, props, updated_at) "
+                      "VALUES (?1, ?2, ?3, ?4) "
+                      "ON CONFLICT(qualified_name, source) DO UPDATE SET "
+                      "props=excluded.props, updated_at=excluded.updated_at";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "annotations_upsert");
+        return CBM_STORE_ERR;
+    }
+
+    bool own_txn = (cbm_store_begin(s) == CBM_STORE_OK);
+    int rc = CBM_STORE_OK;
+    const char *written_source = NULL; /* first row actually stored — see out_matched below */
+    for (int i = 0; i < count; i++) {
+        if (!rows[i].qualified_name || !rows[i].qualified_name[0]) {
+            continue; /* unkeyable row — nothing to attach it to */
+        }
+        if (!written_source) {
+            written_source = safe_str(rows[i].source);
+        }
+        sqlite3_reset(stmt);
+        sqlite3_clear_bindings(stmt);
+        bind_text(stmt, ST_COL_1, rows[i].qualified_name);
+        bind_text(stmt, ST_COL_2, safe_str(rows[i].source));
+        bind_text(stmt, ST_COL_3, safe_props(rows[i].props_json));
+        bind_text(stmt, ST_COL_4, rows[i].updated_at ? rows[i].updated_at : now);
+        if (sqlite3_step(stmt) != SQLITE_DONE) {
+            store_set_error_sqlite(s, "annotations_upsert");
+            rc = CBM_STORE_ERR;
+            break;
+        }
+    }
+    sqlite3_finalize(stmt);
+    if (own_txn) {
+        if (rc == CBM_STORE_OK) {
+            cbm_store_commit(s);
+        } else {
+            cbm_store_rollback(s);
+        }
+    }
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+
+    /* How many of THIS source's stored keys actually resolve to a node — the
+     * signal the caller needs to notice a qualified_name convention mismatch
+     * (all rows stored, none joining) instead of assuming a silent success.
+     * Scoped to the source actually written, so a co-resident annotator's
+     * matches are never miscredited to this import (and a call that stored
+     * nothing reports 0 rather than the incumbent source's tally). */
+    if (out_matched && project && written_source) {
+        sqlite3_stmt *mstmt = NULL;
+        if (sqlite3_prepare_v2(s->db,
+                               "SELECT COUNT(*) FROM node_annotations a JOIN nodes n "
+                               "ON n.qualified_name = a.qualified_name "
+                               "WHERE n.project = ?1 AND a.source = ?2",
+                               CBM_NOT_FOUND, &mstmt, NULL) == SQLITE_OK) {
+            bind_text(mstmt, ST_COL_1, project);
+            bind_text(mstmt, ST_COL_2, written_source);
+            if (sqlite3_step(mstmt) == SQLITE_ROW) {
+                *out_matched = sqlite3_column_int(mstmt, 0);
+            }
+            sqlite3_finalize(mstmt);
+        }
+    }
+    return CBM_STORE_OK;
+}
+
+int cbm_store_annotations_get(cbm_store_t *s, const char *qn, const char *source, int limit,
+                              cbm_annotation_t **out, int *count) {
+    if (out) {
+        *out = NULL;
+    }
+    if (count) {
+        *count = 0;
+    }
+    if (!s || !s->db || !out || !count) {
+        return CBM_STORE_ERR;
+    }
+    if (!annotations_table_exists(s)) {
+        return CBM_STORE_NOT_FOUND;
+    }
+    if (limit <= 0) {
+        limit = ST_MAX_DEGREE; /* generous default ceiling; callers pass their own */
+    }
+
+    /* ?1 qn filter (NULL = any), ?2 source filter (NULL = any), ?3 limit. */
+    const char *sql = "SELECT qualified_name, source, props, updated_at FROM node_annotations "
+                      "WHERE (?1 IS NULL OR qualified_name = ?1) "
+                      "AND (?2 IS NULL OR source = ?2) "
+                      "ORDER BY qualified_name, source LIMIT ?3";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "annotations_get");
+        return CBM_STORE_ERR;
+    }
+    if (qn && qn[0]) {
+        bind_text(stmt, ST_COL_1, qn);
+    } else {
+        sqlite3_bind_null(stmt, ST_COL_1);
+    }
+    if (source && source[0]) {
+        bind_text(stmt, ST_COL_2, source);
+    } else {
+        sqlite3_bind_null(stmt, ST_COL_2);
+    }
+    sqlite3_bind_int(stmt, ST_COL_3, limit);
+
+    int cap = ST_INIT_CAP_8;
+    int n = 0;
+    cbm_annotation_t *arr = malloc((size_t)cap * sizeof(*arr));
+    if (!arr) {
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
+    }
+    int scan_rc32;
+    while ((scan_rc32 = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (n >= cap) {
+            cap *= ST_GROWTH;
+            arr = safe_realloc(arr, (size_t)cap * sizeof(*arr));
+        }
+        arr[n].qualified_name = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
+        arr[n].source = heap_strdup((const char *)sqlite3_column_text(stmt, SKIP_ONE));
+        arr[n].props_json = heap_strdup((const char *)sqlite3_column_text(stmt, CBM_SZ_2));
+        arr[n].updated_at = heap_strdup((const char *)sqlite3_column_text(stmt, CBM_SZ_3));
+        n++;
+    }
+    if (scan_rc32 != SQLITE_DONE) { /* SCANCHK:32:stmt */
+        store_set_error_sqlite(s, "row scan aborted");
+        sqlite3_finalize(stmt);
+        cbm_store_free_annotations(arr, n);
+        return CBM_STORE_ERR;
+    }
+    sqlite3_finalize(stmt);
+    if (n == 0) {
+        /* NOT_FOUND hands back nothing to free — callers must not have to guard
+         * a free on an empty result. */
+        free(arr);
+        return CBM_STORE_NOT_FOUND;
+    }
+    *out = arr;
+    *count = n;
+    return CBM_STORE_OK;
+}
+
+int cbm_store_annotations_count(cbm_store_t *s, const char *source) {
+    if (!s || !s->db || !annotations_table_exists(s)) {
+        return 0;
+    }
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db,
+                           "SELECT COUNT(*) FROM node_annotations "
+                           "WHERE (?1 IS NULL OR source = ?1)",
+                           CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "annotations_count");
+        return CBM_STORE_ERR;
+    }
+    if (source && source[0]) {
+        bind_text(stmt, ST_COL_1, source);
+    } else {
+        sqlite3_bind_null(stmt, ST_COL_1);
+    }
+    int total = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        total = sqlite3_column_int(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    return total;
+}
+
+int cbm_store_annotations_sources(cbm_store_t *s, char ***out, int **out_counts, int *count) {
+    if (out) {
+        *out = NULL;
+    }
+    if (out_counts) {
+        *out_counts = NULL;
+    }
+    if (count) {
+        *count = 0;
+    }
+    if (!s || !s->db || !out || !out_counts || !count) {
+        return CBM_STORE_ERR;
+    }
+    if (!annotations_table_exists(s)) {
+        return CBM_STORE_NOT_FOUND;
+    }
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db,
+                           "SELECT source, COUNT(*) FROM node_annotations "
+                           "GROUP BY source ORDER BY source",
+                           CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "annotations_sources");
+        return CBM_STORE_ERR;
+    }
+    int cap = ST_INIT_CAP_4;
+    int n = 0;
+    char **names = malloc((size_t)cap * sizeof(char *));
+    int *counts = malloc((size_t)cap * sizeof(int));
+    if (!names || !counts) {
+        free(names);
+        free(counts);
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
+    }
+    int scan_rc33;
+    while ((scan_rc33 = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (n >= cap) {
+            cap *= ST_GROWTH;
+            names = safe_realloc(names, (size_t)cap * sizeof(char *));
+            counts = safe_realloc(counts, (size_t)cap * sizeof(int));
+        }
+        names[n] = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
+        counts[n] = sqlite3_column_int(stmt, SKIP_ONE);
+        n++;
+    }
+    if (scan_rc33 != SQLITE_DONE) { /* SCANCHK:33:stmt */
+        store_set_error_sqlite(s, "row scan aborted");
+        sqlite3_finalize(stmt);
+        for (int di = 0; di < n; di++) {
+            free(names[di]);
+        }
+        free(names);
+        free(counts);
+        return CBM_STORE_ERR;
+    }
+    sqlite3_finalize(stmt);
+    *out = names;
+    *out_counts = counts;
+    *count = n;
+    return CBM_STORE_OK;
+}
+
+int cbm_store_annotations_delete(cbm_store_t *s, const char *source) {
+    if (!s || !s->db) {
+        return CBM_STORE_ERR;
+    }
+    if (!annotations_table_exists(s)) {
+        return 0;
+    }
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db,
+                           "DELETE FROM node_annotations WHERE (?1 IS NULL OR source = ?1)",
+                           CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "annotations_delete");
+        return CBM_STORE_ERR;
+    }
+    if (source && source[0]) {
+        bind_text(stmt, ST_COL_1, source);
+    } else {
+        sqlite3_bind_null(stmt, ST_COL_1);
+    }
+    int rc = sqlite3_step(stmt);
+    int changes = sqlite3_changes(s->db);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        store_set_error_sqlite(s, "annotations_delete");
+        return CBM_STORE_ERR;
+    }
+    return changes;
+}
+
+bool cbm_store_has_annotations(cbm_store_t *s) {
+    if (!s || !s->db) {
+        return false;
+    }
+    /* One prepare per store, then a reset+step per call: cheap enough that the
+     * query layer can gate every annotation lookup on it, which keeps projects
+     * with no annotations at exactly their previous cost. */
+    if (!s->stmt_ann_probe) {
+        if (!annotations_table_exists(s)) {
+            return false;
+        }
+        if (sqlite3_prepare_v2(s->db, "SELECT 1 FROM node_annotations LIMIT 1", CBM_NOT_FOUND,
+                               &s->stmt_ann_probe, NULL) != SQLITE_OK) {
+            s->stmt_ann_probe = NULL;
+            return false;
+        }
+    }
+    sqlite3_reset(s->stmt_ann_probe);
+    return sqlite3_step(s->stmt_ann_probe) == SQLITE_ROW;
+}
+
+int cbm_store_annotation_prop(cbm_store_t *s, const char *qn, const char *key, char *buf,
+                              size_t bufsz) {
+    if (!buf || bufsz == 0) {
+        return CBM_STORE_ERR;
+    }
+    buf[0] = '\0';
+    if (!s || !s->db || !qn || !qn[0] || !key || !key[0]) {
+        return CBM_STORE_NOT_FOUND;
+    }
+    if (!annotations_table_exists(s)) {
+        return CBM_STORE_NOT_FOUND;
+    }
+    /* json_extract, not a JSON parse in C: SQLite reads the one key out of the
+     * props blob, and the (qualified_name, source) primary key makes the row
+     * lookup an index seek. Sources are visited in name order and the first
+     * one carrying the key wins, so the result is stable rather than
+     * whichever row SQLite happens to return first. */
+    if (!s->stmt_ann_prop) {
+        if (sqlite3_prepare_v2(s->db,
+                               "SELECT json_extract(props, '$.\"' || ?2 || '\"') AS v "
+                               "FROM node_annotations WHERE qualified_name = ?1 "
+                               "AND v IS NOT NULL ORDER BY source LIMIT 1",
+                               CBM_NOT_FOUND, &s->stmt_ann_prop, NULL) != SQLITE_OK) {
+            s->stmt_ann_prop = NULL;
+            store_set_error_sqlite(s, "annotation_prop");
+            return CBM_STORE_ERR;
+        }
+    }
+    sqlite3_reset(s->stmt_ann_prop);
+    sqlite3_clear_bindings(s->stmt_ann_prop);
+    bind_text(s->stmt_ann_prop, ST_COL_1, qn);
+    bind_text(s->stmt_ann_prop, ST_COL_2, key);
+    if (sqlite3_step(s->stmt_ann_prop) != SQLITE_ROW) {
+        return CBM_STORE_NOT_FOUND;
+    }
+    const char *val = (const char *)sqlite3_column_text(s->stmt_ann_prop, 0);
+    if (!val) {
+        return CBM_STORE_NOT_FOUND;
+    }
+    snprintf(buf, bufsz, "%s", val);
+    return CBM_STORE_OK;
+}
+
+char *cbm_store_annotations_merged_json(cbm_store_t *s, const char *qn) {
+    if (!s || !s->db || !qn || !qn[0]) {
+        return NULL;
+    }
+    if (!annotations_table_exists(s)) {
+        return NULL;
+    }
+    /* {"<source>": <props>, ...} — keeps each annotator's view distinct rather
+     * than merging keys that may legitimately disagree. */
+    if (!s->stmt_ann_merged) {
+        if (sqlite3_prepare_v2(s->db,
+                               "SELECT json_group_object(source, json(props)) "
+                               "FROM node_annotations WHERE qualified_name = ?1",
+                               CBM_NOT_FOUND, &s->stmt_ann_merged, NULL) != SQLITE_OK) {
+            s->stmt_ann_merged = NULL;
+            store_set_error_sqlite(s, "annotations_merged");
+            return NULL;
+        }
+    }
+    sqlite3_reset(s->stmt_ann_merged);
+    sqlite3_clear_bindings(s->stmt_ann_merged);
+    bind_text(s->stmt_ann_merged, ST_COL_1, qn);
+    if (sqlite3_step(s->stmt_ann_merged) != SQLITE_ROW) {
+        return NULL;
+    }
+    const char *json = (const char *)sqlite3_column_text(s->stmt_ann_merged, 0);
+    /* json_group_object over zero rows yields "{}" — report that as "no
+     * annotations" so callers need not special-case an empty object. */
+    if (!json || !json[0] || strcmp(json, "{}") == 0) {
+        return NULL;
+    }
+    return heap_strdup(json);
+}
+
+void cbm_store_free_annotations(cbm_annotation_t *rows, int count) {
+    if (!rows) {
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        safe_str_free(&rows[i].qualified_name);
+        safe_str_free(&rows[i].source);
+        safe_str_free(&rows[i].props_json);
+        safe_str_free(&rows[i].updated_at);
+    }
+    free(rows);
 }
 
 /* ── Architecture doc discovery ────────────────────────────────── */

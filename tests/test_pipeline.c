@@ -344,6 +344,94 @@ TEST(pipeline_adr_survives_full_reindex) {
     PASS();
 }
 
+/* External annotations (import_annotations) must survive a full re-index for the
+ * same reason an ADR must: the re-index deletes the DB file and rebuilds it from
+ * the graph buffer, which knows nothing about node_annotations. Their
+ * qualified_name keys stay valid across the rebuild, so the rows are captured
+ * before the delete and restored after — otherwise an import silently vanishes
+ * on the next index run. */
+TEST(pipeline_annotations_survive_full_reindex) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_ann_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("failed to create temp dir");
+    }
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test.db", tmp);
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/main.py", tmp);
+    FILE *f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "def foo():\n    pass\n");
+    fclose(f);
+
+    cbm_pipeline_t *p1 = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p1);
+    ASSERT_EQ(cbm_pipeline_run(p1), 0);
+    char project_copy[256];
+    snprintf(project_copy, sizeof(project_copy), "%s", cbm_pipeline_project_name(p1));
+    cbm_pipeline_free(p1);
+
+    /* Annotate a node the indexer really produced, so the row is one that JOINS
+     * — the point of the test is that it still joins after the rebuild. */
+    cbm_store_t *s1 = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s1);
+    cbm_node_t *found = NULL;
+    int found_count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_name(s1, project_copy, "foo", &found, &found_count),
+              CBM_STORE_OK);
+    ASSERT_GT(found_count, 0);
+    char foo_qn[512];
+    snprintf(foo_qn, sizeof(foo_qn), "%s", found[0].qualified_name);
+    cbm_store_free_nodes(found, found_count);
+
+    cbm_annotation_t row = {.qualified_name = foo_qn,
+                            .source = "elaborator",
+                            .props_json = "{\"hier_path\":\"ox.ooo.rau\"}"};
+    int matched = 0;
+    ASSERT_EQ(cbm_store_annotations_upsert(s1, project_copy, &row, 1, &matched), CBM_STORE_OK);
+    ASSERT_EQ(matched, 1);
+    cbm_store_close(s1);
+
+    /* Force a full re-index (adds enough files to cross the incremental
+     * threshold), which deletes and rebuilds the DB. */
+    for (int i = 0; i < 4; i++) {
+        snprintf(path, sizeof(path), "%s/extra%d.py", tmp, i);
+        f = fopen(path, "w");
+        ASSERT_NOT_NULL(f);
+        fprintf(f, "def g%d():\n    return %d\n", i, i);
+        fclose(f);
+    }
+    cbm_pipeline_t *p2 = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p2);
+    ASSERT_EQ(cbm_pipeline_run(p2), 0);
+    cbm_pipeline_free(p2);
+
+    cbm_store_t *s2 = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s2);
+    ASSERT_TRUE(cbm_store_has_annotations(s2));
+    char buf[128];
+    ASSERT_EQ(cbm_store_annotation_prop(s2, foo_qn, "hier_path", buf, sizeof(buf)), CBM_STORE_OK);
+    ASSERT_STR_EQ(buf, "ox.ooo.rau");
+
+    /* And it still JOINS the rebuilt node — the rebuild re-inserts every node
+     * from scratch (fresh AUTOINCREMENT ids), which is exactly why the
+     * annotation key is qualified_name and not the id. */
+    cbm_node_t after = {0};
+    ASSERT_EQ(cbm_store_find_node_by_qn(s2, project_copy, foo_qn, &after), CBM_STORE_OK);
+    cbm_node_free_fields(&after);
+    int matched_after = 0;
+    ASSERT_EQ(cbm_store_annotations_upsert(s2, project_copy, &row, 1, &matched_after),
+              CBM_STORE_OK);
+    ASSERT_EQ(matched_after, 1);
+    cbm_store_close(s2);
+
+    rm_rf(tmp);
+    PASS();
+}
+
 TEST(pipeline_structure_edges) {
     if (setup_test_repo() != 0) {
         FAIL("failed to create temp dir");
@@ -6905,6 +6993,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_structure_nodes);
     RUN_TEST(pipeline_committed_counts_match_persisted);
     RUN_TEST(pipeline_adr_survives_full_reindex);
+    RUN_TEST(pipeline_annotations_survive_full_reindex);
     RUN_TEST(pipeline_structure_edges);
     RUN_TEST(pipeline_branch_root_structure);
     RUN_TEST(pipeline_project_name_derived);

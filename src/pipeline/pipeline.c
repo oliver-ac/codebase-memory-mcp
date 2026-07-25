@@ -12,7 +12,18 @@
  */
 #include "foundation/constants.h"
 
-enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 6, PL_WAL_BUF = 1040 };
+enum {
+    CBM_DIR_PERMS = 0755,
+    PL_RING = 4,
+    PL_RING_MASK = 3,
+    PL_SEQ_PASSES = 6,
+    PL_WAL_BUF = 1040,
+    /* Ceiling on annotations carried across a full re-index. Well above any real
+     * annotated repo (a whole-kernel-scale import is ~10^4 rows); a set larger
+     * than this is truncated rather than held wholly in memory mid-index, and
+     * the truncation is logged, never silent. */
+    PL_ANNOTATIONS_CARRY_MAX = 200000,
+};
 #define PL_NSEC_PER_SEC 1000000000LL
 #include "pipeline/pipeline.h"
 #include "pipeline/artifact.h"
@@ -120,6 +131,13 @@ struct cbm_pipeline {
     /* ADR (project_summaries) captured before a full-reindex DB delete, so it
      * can be restored after the rebuild. NULL when no ADR existed. Issue #516. */
     char *saved_adr;
+
+    /* External node annotations (node_annotations) captured before the same
+     * delete. They are keyed by qualified_name — stable across a rebuild — so
+     * carrying them over is what makes an import survive a re-index instead of
+     * silently vanishing with the old DB file. NULL/0 when none existed. */
+    cbm_annotation_t *saved_annotations;
+    int saved_annotation_count;
 };
 
 /* ── Global pkgmap (one active pipeline at a time) ─────────────── */
@@ -242,6 +260,9 @@ void cbm_pipeline_free(cbm_pipeline_t *p) {
     free(p->saved_adr); /* freed here too: error paths can exit before the
                          * restore in dump_and_persist_hashes runs. Issue #516. */
     p->saved_adr = NULL;
+    cbm_store_free_annotations(p->saved_annotations, p->saved_annotation_count);
+    p->saved_annotations = NULL;
+    p->saved_annotation_count = 0;
     cbm_git_context_free(&p->git_ctx);
     /* gbuf, store, registry freed during/after run */
     /* Defensively free userconfig in case run() was never called or panicked */
@@ -1135,7 +1156,10 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
     }
     cbm_log_info("pipeline.route", "path", "reindex", "action", "deleting old db");
     /* Capture any ADR before deleting the DB so the full-reindex rebuild can
-     * restore it (project_summaries is otherwise lost). Issue #516. */
+     * restore it (project_summaries is otherwise lost). Issue #516.
+     * Same for external node annotations: a full re-index deletes the DB file
+     * wholesale, so without this an imported annotation set would disappear on
+     * the next index run even though its qualified_name keys stay valid. */
     {
         cbm_store_t *adr_store = cbm_store_open_path(db_path);
         if (adr_store) {
@@ -1147,6 +1171,11 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
                 }
                 cbm_store_adr_free(&existing);
             }
+            cbm_store_free_annotations(p->saved_annotations, p->saved_annotation_count);
+            p->saved_annotations = NULL;
+            p->saved_annotation_count = 0;
+            (void)cbm_store_annotations_get(adr_store, NULL, NULL, PL_ANNOTATIONS_CARRY_MAX,
+                                            &p->saved_annotations, &p->saved_annotation_count);
             cbm_store_close(adr_store);
         }
     }
@@ -1241,6 +1270,26 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
             }
         }
         CBM_PROF_END("persist", "3_adr_restore", t_adr);
+
+        /* Restore the external annotations captured before the DB delete. Their
+         * qualified_name keys survive the rebuild, so the rows re-attach to the
+         * freshly minted nodes. A failed restore is logged, not swallowed —
+         * losing an import silently is the failure mode this exists to avoid. */
+        if (p->saved_annotation_count > 0 && p->saved_annotations) {
+            if (cbm_store_annotations_upsert(hash_store, p->project_name, p->saved_annotations,
+                                             p->saved_annotation_count, NULL) != CBM_STORE_OK) {
+                cbm_log_error("pipeline.err", "phase", "annotations_restore", "project",
+                              p->project_name, "rows", itoa_buf(p->saved_annotation_count));
+            } else {
+                cbm_log_info("pipeline.annotations_restored", "project", p->project_name, "rows",
+                             itoa_buf(p->saved_annotation_count));
+            }
+            if (p->saved_annotation_count >= PL_ANNOTATIONS_CARRY_MAX) {
+                cbm_log_warn("pipeline.annotations_truncated", "project", p->project_name,
+                             "carried", itoa_buf(PL_ANNOTATIONS_CARRY_MAX), "action",
+                             "re-run import_annotations to restore the remainder");
+            }
+        }
 
         /* Batch the per-file hash upserts into ONE transaction. The per-file
          * cbm_store_upsert_file_hash path autocommits, i.e. file_count fsyncs
@@ -1376,6 +1425,9 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
     }
     free(p->saved_adr);
     p->saved_adr = NULL;
+    cbm_store_free_annotations(p->saved_annotations, p->saved_annotation_count);
+    p->saved_annotations = NULL;
+    p->saved_annotation_count = 0;
 
     /* Export persistent artifact if enabled */
     if (p->persistence) {

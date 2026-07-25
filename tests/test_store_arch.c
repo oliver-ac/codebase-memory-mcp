@@ -877,6 +877,276 @@ TEST(adr_validate_keys_empty) {
     PASS();
 }
 
+/* ── Node annotation tests ──────────────────────────────────────── */
+
+/* One node, so annotations have something to join against. */
+static cbm_store_t *setup_annotation_store(void) {
+    cbm_store_t *s = cbm_store_open_memory();
+    if (!s) {
+        return NULL;
+    }
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+    cbm_node_t n = {.project = "test",
+                    .label = "Class",
+                    .name = "rau",
+                    .qualified_name = "test.rtl.rau.rau",
+                    .file_path = "rtl/rau.sv"};
+    cbm_store_upsert_node(s, &n);
+    return s;
+}
+
+TEST(annotations_upsert_and_get) {
+    cbm_store_t *s = setup_annotation_store();
+    ASSERT_NOT_NULL(s);
+
+    const cbm_annotation_t rows[] = {
+        {.qualified_name = "test.rtl.rau.rau",
+         .source = "elaborator",
+         .props_json = "{\"hier_path\":\"ox.ooo.rau\",\"n_instances\":2}"},
+        {.qualified_name = "test.rtl.rau.t_rau_state", .source = "elaborator",
+         .props_json = "{\"width\":7}"},
+    };
+    int matched = -1;
+    ASSERT_EQ(cbm_store_annotations_upsert(s, "test", rows, 2, &matched), CBM_STORE_OK);
+    /* Only the first qn names a real node; the second is stored but inert. */
+    ASSERT_EQ(matched, 1);
+    ASSERT_EQ(cbm_store_annotations_count(s, NULL), 2);
+
+    cbm_annotation_t *got = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_annotations_get(s, "test.rtl.rau.rau", NULL, 0, &got, &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    ASSERT_STR_EQ(got[0].source, "elaborator");
+    ASSERT_NOT_NULL(strstr(got[0].props_json, "ox.ooo.rau"));
+    /* updated_at is stamped by the store when the caller passes none. */
+    ASSERT_TRUE(got[0].updated_at != NULL && got[0].updated_at[0] != '\0');
+    cbm_store_free_annotations(got, count);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(annotations_upsert_replaces_props_for_same_key) {
+    cbm_store_t *s = setup_annotation_store();
+    ASSERT_NOT_NULL(s);
+
+    cbm_annotation_t row = {.qualified_name = "test.rtl.rau.rau",
+                            .source = "elaborator",
+                            .props_json = "{\"width\":8}"};
+    ASSERT_EQ(cbm_store_annotations_upsert(s, "test", &row, 1, NULL), CBM_STORE_OK);
+    row.props_json = "{\"width\":16}";
+    ASSERT_EQ(cbm_store_annotations_upsert(s, "test", &row, 1, NULL), CBM_STORE_OK);
+
+    /* Re-import replaces, never duplicates. */
+    ASSERT_EQ(cbm_store_annotations_count(s, NULL), 1);
+    cbm_annotation_t *got = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_annotations_get(s, "test.rtl.rau.rau", NULL, 0, &got, &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    ASSERT_NOT_NULL(strstr(got[0].props_json, "16"));
+    cbm_store_free_annotations(got, count);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(annotations_namespaced_by_source) {
+    cbm_store_t *s = setup_annotation_store();
+    ASSERT_NOT_NULL(s);
+
+    /* Two annotators on the SAME node must coexist, not overwrite each other. */
+    const cbm_annotation_t rows[] = {
+        {.qualified_name = "test.rtl.rau.rau", .source = "elaborator",
+         .props_json = "{\"hier_path\":\"ox.ooo.rau\"}"},
+        {.qualified_name = "test.rtl.rau.rau", .source = "profiler",
+         .props_json = "{\"samples\":991}"},
+    };
+    ASSERT_EQ(cbm_store_annotations_upsert(s, "test", rows, 2, NULL), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_annotations_count(s, NULL), 2);
+    ASSERT_EQ(cbm_store_annotations_count(s, "profiler"), 1);
+
+    cbm_annotation_t *got = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_annotations_get(s, "test.rtl.rau.rau", "profiler", 0, &got, &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    ASSERT_NOT_NULL(strstr(got[0].props_json, "991"));
+    cbm_store_free_annotations(got, count);
+
+    char **sources = NULL;
+    int *counts = NULL;
+    int src_count = 0;
+    ASSERT_EQ(cbm_store_annotations_sources(s, &sources, &counts, &src_count), CBM_STORE_OK);
+    ASSERT_EQ(src_count, 2);
+    ASSERT_STR_EQ(sources[0], "elaborator"); /* ordered by source */
+    ASSERT_EQ(counts[0], 1);
+    for (int i = 0; i < src_count; i++) {
+        free(sources[i]);
+    }
+    free(sources);
+    free(counts);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+/* The whole reason annotations are keyed on qualified_name: node ids are
+ * AUTOINCREMENT, so a re-index mints new ones. Annotations must still resolve. */
+TEST(annotations_survive_node_rebuild) {
+    cbm_store_t *s = setup_annotation_store();
+    ASSERT_NOT_NULL(s);
+
+    cbm_annotation_t row = {.qualified_name = "test.rtl.rau.rau",
+                            .source = "elaborator",
+                            .props_json = "{\"hier_path\":\"ox.ooo.rau\"}"};
+    ASSERT_EQ(cbm_store_annotations_upsert(s, "test", &row, 1, NULL), CBM_STORE_OK);
+
+    /* Simulate a re-index: drop the graph, rebuild the same node (new id). */
+    ASSERT_EQ(cbm_store_delete_nodes_by_project(s, "test"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_count_nodes(s, "test"), 0);
+    cbm_node_t rebuilt = {.project = "test",
+                          .label = "Class",
+                          .name = "rau",
+                          .qualified_name = "test.rtl.rau.rau",
+                          .file_path = "rtl/rau.sv"};
+    ASSERT_TRUE(cbm_store_upsert_node(s, &rebuilt) > 0);
+
+    int matched = -1;
+    ASSERT_EQ(cbm_store_annotations_upsert(s, "test", &row, 1, &matched), CBM_STORE_OK);
+    ASSERT_EQ(matched, 1);
+    cbm_annotation_t *got = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_annotations_get(s, "test.rtl.rau.rau", NULL, 0, &got, &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    ASSERT_NOT_NULL(strstr(got[0].props_json, "ox.ooo.rau"));
+    cbm_store_free_annotations(got, count);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(annotations_delete_scoped_to_source) {
+    cbm_store_t *s = setup_annotation_store();
+    ASSERT_NOT_NULL(s);
+
+    const cbm_annotation_t rows[] = {
+        {.qualified_name = "test.rtl.rau.rau", .source = "elaborator", .props_json = "{\"a\":1}"},
+        {.qualified_name = "test.rtl.rau.rau", .source = "profiler", .props_json = "{\"b\":2}"},
+    };
+    ASSERT_EQ(cbm_store_annotations_upsert(s, "test", rows, 2, NULL), CBM_STORE_OK);
+
+    ASSERT_EQ(cbm_store_annotations_delete(s, "profiler"), 1);
+    ASSERT_EQ(cbm_store_annotations_count(s, NULL), 1);
+    ASSERT_EQ(cbm_store_annotations_delete(s, NULL), 1); /* NULL source = all */
+    ASSERT_EQ(cbm_store_annotations_count(s, NULL), 0);
+
+    /* Clearing a source is delete + upsert-nothing, so an empty row set must
+     * report success, not an argument error. */
+    ASSERT_EQ(cbm_store_annotations_upsert(s, "test", NULL, 0, NULL), CBM_STORE_OK);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(annotations_get_no_match_is_not_found) {
+    cbm_store_t *s = setup_annotation_store();
+    ASSERT_NOT_NULL(s);
+
+    cbm_annotation_t *got = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_annotations_get(s, "test.nope", NULL, 0, &got, &count),
+              CBM_STORE_NOT_FOUND);
+    ASSERT_EQ(count, 0);
+    ASSERT_NULL(got);
+    ASSERT_EQ(cbm_store_annotations_count(s, NULL), 0);
+    /* Deleting from an empty table is a no-op, not an error. */
+    ASSERT_EQ(cbm_store_annotations_delete(s, NULL), 0);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+/* The read path the query layer uses: a cheap "any annotations?" gate, a
+ * single-key lookup, and the per-node roll-up. */
+TEST(annotations_read_path_probe_prop_and_merged) {
+    cbm_store_t *s = setup_annotation_store();
+    ASSERT_NOT_NULL(s);
+
+    /* The gate is what keeps un-annotated projects at their previous cost. */
+    ASSERT_FALSE(cbm_store_has_annotations(s));
+    char buf[64];
+    ASSERT_EQ(cbm_store_annotation_prop(s, "test.rtl.rau.rau", "hier_path", buf, sizeof(buf)),
+              CBM_STORE_NOT_FOUND);
+    ASSERT_NULL(cbm_store_annotations_merged_json(s, "test.rtl.rau.rau"));
+
+    const cbm_annotation_t rows[] = {
+        {.qualified_name = "test.rtl.rau.rau",
+         .source = "elaborator",
+         .props_json = "{\"hier_path\":\"ox.ooo.rau\",\"width\":7}"},
+        {.qualified_name = "test.rtl.rau.rau", .source = "profiler",
+         .props_json = "{\"samples\":991}"},
+    };
+    ASSERT_EQ(cbm_store_annotations_upsert(s, "test", rows, 2, NULL), CBM_STORE_OK);
+
+    ASSERT_TRUE(cbm_store_has_annotations(s));
+    ASSERT_EQ(cbm_store_annotation_prop(s, "test.rtl.rau.rau", "hier_path", buf, sizeof(buf)),
+              CBM_STORE_OK);
+    ASSERT_STR_EQ(buf, "ox.ooo.rau");
+    /* A key from the OTHER source resolves too — lookup spans sources. */
+    ASSERT_EQ(cbm_store_annotation_prop(s, "test.rtl.rau.rau", "samples", buf, sizeof(buf)),
+              CBM_STORE_OK);
+    ASSERT_STR_EQ(buf, "991");
+    /* Numbers come back as their text so the query layer compares uniformly. */
+    ASSERT_EQ(cbm_store_annotation_prop(s, "test.rtl.rau.rau", "width", buf, sizeof(buf)),
+              CBM_STORE_OK);
+    ASSERT_STR_EQ(buf, "7");
+    ASSERT_EQ(cbm_store_annotation_prop(s, "test.rtl.rau.rau", "absent", buf, sizeof(buf)),
+              CBM_STORE_NOT_FOUND);
+    ASSERT_EQ(cbm_store_annotation_prop(s, "test.no.such.node", "hier_path", buf, sizeof(buf)),
+              CBM_STORE_NOT_FOUND);
+
+    /* Merged view keeps sources separate rather than flattening them. */
+    char *merged = cbm_store_annotations_merged_json(s, "test.rtl.rau.rau");
+    ASSERT_NOT_NULL(merged);
+    ASSERT_NOT_NULL(strstr(merged, "\"elaborator\""));
+    ASSERT_NOT_NULL(strstr(merged, "\"profiler\""));
+    ASSERT_NOT_NULL(strstr(merged, "ox.ooo.rau"));
+    free(merged);
+    ASSERT_NULL(cbm_store_annotations_merged_json(s, "test.no.such.node"));
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(annotations_upsert_skips_unkeyable_rows) {
+    cbm_store_t *s = setup_annotation_store();
+    ASSERT_NOT_NULL(s);
+
+    const cbm_annotation_t rows[] = {
+        {.qualified_name = "", .source = "elaborator", .props_json = "{\"a\":1}"},
+        {.qualified_name = NULL, .source = "elaborator", .props_json = "{\"b\":2}"},
+        {.qualified_name = "test.rtl.rau.rau", .source = "elaborator", .props_json = NULL},
+    };
+    int matched = -1;
+    ASSERT_EQ(cbm_store_annotations_upsert(s, "test", rows, 3, &matched), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_annotations_count(s, NULL), 1);
+    ASSERT_EQ(matched, 1);
+
+    /* A NULL props_json is normalized to an empty JSON object, never NULL. */
+    cbm_annotation_t *got = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_annotations_get(s, NULL, NULL, 0, &got, &count), CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    ASSERT_STR_EQ(got[0].props_json, "{}");
+    cbm_store_free_annotations(got, count);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 /* ── Louvain tests ──────────────────────────────────────────────── */
 
 TEST(louvain_basic) {
@@ -1403,6 +1673,16 @@ SUITE(store_arch) {
     RUN_TEST(adr_validate_keys_valid);
     RUN_TEST(adr_validate_keys_invalid);
     RUN_TEST(adr_validate_keys_empty);
+
+    /* Node annotations */
+    RUN_TEST(annotations_upsert_and_get);
+    RUN_TEST(annotations_upsert_replaces_props_for_same_key);
+    RUN_TEST(annotations_namespaced_by_source);
+    RUN_TEST(annotations_survive_node_rebuild);
+    RUN_TEST(annotations_delete_scoped_to_source);
+    RUN_TEST(annotations_get_no_match_is_not_found);
+    RUN_TEST(annotations_read_path_probe_prop_and_merged);
+    RUN_TEST(annotations_upsert_skips_unkeyable_rows);
 
     /* Louvain */
     RUN_TEST(louvain_basic);

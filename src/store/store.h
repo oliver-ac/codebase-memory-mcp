@@ -701,6 +701,70 @@ int cbm_adr_validate_content(const char *content, char *errbuf, int errbuf_size)
 int cbm_adr_validate_section_keys(const char **keys, int count, char *errbuf, int errbuf_size);
 void cbm_adr_sections_free(cbm_adr_sections_t *s);
 
+/* ── Node annotations (external per-node metadata) ─────────────── */
+
+/* One annotation row: arbitrary JSON `props` attached to the node with this
+ * `qualified_name`, namespaced by `source` (the annotator's name).
+ *
+ * Annotations exist for facts the indexer cannot derive from the syntax tree —
+ * an elaborated instance hierarchy, resolved bit widths, profiler counts — that
+ * an external producer computes and hands to cbm. They live in a side table
+ * keyed on `qualified_name` (the only node identifier stable across re-index;
+ * node ids are AUTOINCREMENT), so a graph rebuild does not drop them, and rows
+ * for qualified_names that no longer exist are inert rather than an error. */
+typedef struct {
+    const char *qualified_name;
+    const char *source;
+    const char *props_json;
+    const char *updated_at; /* ISO 8601; NULL on upsert = stamp now */
+} cbm_annotation_t;
+
+/* Upsert `count` annotation rows in one transaction (conflicts on
+ * (qualified_name, source) replace props). Rows with an empty qualified_name
+ * are skipped. When `project` and `out_matched` are given, *out_matched
+ * receives how many of the written source's rows join a node in that project —
+ * the signal that distinguishes a real import from a qualified_name convention
+ * mismatch. Requires a writable store. */
+int cbm_store_annotations_upsert(cbm_store_t *s, const char *project,
+                                 const cbm_annotation_t *rows, int count, int *out_matched);
+
+/* Fetch annotation rows: `qn` NULL/"" = any node, `source` NULL/"" = any
+ * source, `limit` <= 0 = built-in ceiling. Ordered by (qualified_name, source).
+ * Returns CBM_STORE_NOT_FOUND when nothing matches (or the table predates this
+ * feature), leaving *out NULL and *count 0. On CBM_STORE_OK the caller frees
+ * with cbm_store_free_annotations. */
+int cbm_store_annotations_get(cbm_store_t *s, const char *qn, const char *source, int limit,
+                              cbm_annotation_t **out, int *count);
+
+/* Count annotation rows (`source` NULL/"" = all sources). 0 when absent. */
+int cbm_store_annotations_count(cbm_store_t *s, const char *source);
+
+/* List distinct annotation sources with their row counts. Caller frees each
+ * (*out)[i], *out, and *out_counts. */
+int cbm_store_annotations_sources(cbm_store_t *s, char ***out, int **out_counts, int *count);
+
+/* Delete annotation rows (`source` NULL/"" = all). Returns rows deleted, or
+ * CBM_STORE_ERR. */
+int cbm_store_annotations_delete(cbm_store_t *s, const char *source);
+
+/* True when this store holds at least one annotation. Cheap (one cached
+ * statement, one index probe) — the query layer gates per-node annotation
+ * lookups on it so an un-annotated project keeps its previous cost exactly. */
+bool cbm_store_has_annotations(cbm_store_t *s);
+
+/* Read ONE annotation props key for a node into `buf`. Sources are consulted in
+ * name order and the first carrying `key` wins. Returns CBM_STORE_OK when found,
+ * CBM_STORE_NOT_FOUND when the node has no such annotated key. */
+int cbm_store_annotation_prop(cbm_store_t *s, const char *qn, const char *key, char *buf,
+                              size_t bufsz);
+
+/* All annotations for one node as {"<source>": {<props>}, ...} — sources stay
+ * separate so annotators that disagree stay distinguishable. Heap string (caller
+ * frees), or NULL when the node has none. */
+char *cbm_store_annotations_merged_json(cbm_store_t *s, const char *qn);
+
+void cbm_store_free_annotations(cbm_annotation_t *rows, int count);
+
 /* ── Search helpers (exposed for testing) ───────────────────────── */
 
 /* Convert a glob pattern to SQL LIKE pattern. Caller must free result. */

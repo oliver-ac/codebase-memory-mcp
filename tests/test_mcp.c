@@ -338,6 +338,8 @@ TEST(mcp_tools_have_behavior_annotations) {
         {"detect_changes", false, true, true, false},
         {"manage_adr", false, true, false, false},
         {"ingest_traces", false, false, false, false},
+        {"import_annotations", false, false, true, false},
+        {"get_annotations", false, true, true, false},
     };
 
     char *json = cbm_mcp_tools_list();
@@ -729,13 +731,25 @@ TEST(server_handle_tools_list_defaults_to_all_tools_and_accepts_cursor) {
     ASSERT_NOT_NULL(strstr(resp, "ingest_traces"));
     free(resp);
 
+    /* A cursor switches to paged mode (MCP_TOOLS_PAGE_SIZE per page): the page
+     * from 8 covers 8..15 and still advertises the next offset, since the tool
+     * surface is larger than two pages. */
     resp = cbm_mcp_server_handle(
         srv,
         "{\"jsonrpc\":\"2.0\",\"id\":201,\"method\":\"tools/list\",\"params\":{\"cursor\":\"8\"}}");
     ASSERT_NOT_NULL(resp);
     ASSERT_NOT_NULL(strstr(resp, "\"id\":201"));
-    ASSERT_NULL(strstr(resp, "\"nextCursor\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"nextCursor\":\"16\""));
     ASSERT_NOT_NULL(strstr(resp, "manage_adr"));
+    free(resp);
+
+    /* Following that cursor reaches the last page, which terminates paging. */
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":203,\"method\":\"tools/list\",\"params\":{\"cursor\":"
+             "\"16\"}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"id\":203"));
+    ASSERT_NULL(strstr(resp, "\"nextCursor\""));
     free(resp);
 
     cbm_mcp_server_free(srv);
@@ -760,7 +774,7 @@ TEST(server_handle_analysis_profile_filters_and_rejects_mutators) {
     static const char *const analysis_tools[] = {
         "search_graph",     "query_graph",          "trace_path",     "get_code_snippet",
         "get_graph_schema", "get_architecture",     "search_code",    "list_projects",
-        "index_status",     "check_index_coverage", "detect_changes",
+        "index_status",     "check_index_coverage", "detect_changes", "get_annotations",
     };
     ASSERT_EQ(mcp_response_tool_count(resp), sizeof(analysis_tools) / sizeof(analysis_tools[0]));
     for (size_t i = 0U; i < sizeof(analysis_tools) / sizeof(analysis_tools[0]); i++) {
@@ -4036,6 +4050,209 @@ TEST(tool_ingest_traces_empty) {
 }
 
 /* ══════════════════════════════════════════════════════════════════
+ *  NODE ANNOTATIONS (import_annotations / get_annotations)
+ * ══════════════════════════════════════════════════════════════════ */
+
+/* Server backed by an in-memory store holding one node to annotate. */
+static cbm_mcp_server_t *annotation_server(const char *project) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    if (!srv) {
+        return NULL;
+    }
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    if (!st) {
+        cbm_mcp_server_free(srv);
+        return NULL;
+    }
+    cbm_store_upsert_project(st, project, "/tmp/annotations");
+    char qn[128];
+    snprintf(qn, sizeof(qn), "%s.rtl.rau.rau", project);
+    cbm_node_t n = {.project = project,
+                    .label = "Class",
+                    .name = "rau",
+                    .qualified_name = qn,
+                    .file_path = "rtl/rau.sv"};
+    cbm_store_upsert_node(st, &n);
+    cbm_mcp_server_set_project(srv, project);
+    return srv;
+}
+
+TEST(tool_import_annotations_round_trips_via_get) {
+    cbm_mcp_server_t *srv = annotation_server("ann");
+    ASSERT_NOT_NULL(srv);
+
+    char *resp = cbm_mcp_handle_tool(
+        srv, "import_annotations",
+        "{\"project\":\"ann\",\"source\":\"elaborator\",\"annotations\":["
+        "{\"qualified_name\":\"ann.rtl.rau.rau\","
+        "\"props\":{\"hier_path\":\"ox.ooo.rau\",\"width\":7}}]}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(resp, "\\\"imported\\\":1"));
+    ASSERT_NOT_NULL(strstr(resp, "\\\"matched_nodes\\\":1"));
+    /* A payload that matched a node must NOT carry the mismatch warning. */
+    ASSERT_NULL(strstr(resp, "will never join"));
+    free(resp);
+
+    resp = cbm_mcp_handle_tool(
+        srv, "get_annotations",
+        "{\"project\":\"ann\",\"qualified_name\":\"ann.rtl.rau.rau\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "\"isError\":true"));
+    /* props come back as real JSON, not a re-escaped string blob. */
+    ASSERT_NOT_NULL(strstr(resp, "ox.ooo.rau"));
+    ASSERT_NOT_NULL(strstr(resp, "elaborator"));
+    ASSERT_NOT_NULL(strstr(resp, "\\\"returned\\\":1"));
+    /* A single-node query counts THIS node's rows, so total matches returned and
+     * nothing invites paging; the project-wide figure ships separately. */
+    ASSERT_NOT_NULL(strstr(resp, "\\\"total\\\":1"));
+    ASSERT_NOT_NULL(strstr(resp, "\\\"has_more\\\":false"));
+    ASSERT_NOT_NULL(strstr(resp, "\\\"project_total\\\":1"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* Storing rows nobody can join is the classic silent failure of a key-matched
+ * import — the tool must say so instead of reporting a clean success. */
+TEST(tool_import_annotations_warns_when_nothing_matches) {
+    cbm_mcp_server_t *srv = annotation_server("ann");
+    ASSERT_NOT_NULL(srv);
+
+    char *resp = cbm_mcp_handle_tool(srv, "import_annotations",
+                                     "{\"project\":\"ann\",\"source\":\"elaborator\","
+                                     "\"annotations\":[{\"qualified_name\":\"wrong.key.entirely\","
+                                     "\"props\":{\"width\":7}}]}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(resp, "\\\"imported\\\":1"));
+    ASSERT_NOT_NULL(strstr(resp, "\\\"matched_nodes\\\":0"));
+    ASSERT_NOT_NULL(strstr(resp, "will never join"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_import_annotations_replace_clears_only_its_source) {
+    cbm_mcp_server_t *srv = annotation_server("ann");
+    ASSERT_NOT_NULL(srv);
+
+    char *resp = cbm_mcp_handle_tool(
+        srv, "import_annotations",
+        "{\"project\":\"ann\",\"source\":\"profiler\",\"annotations\":["
+        "{\"qualified_name\":\"ann.rtl.rau.rau\",\"props\":{\"samples\":991}}]}");
+    ASSERT_NOT_NULL(resp);
+    free(resp);
+    resp = cbm_mcp_handle_tool(
+        srv, "import_annotations",
+        "{\"project\":\"ann\",\"source\":\"elaborator\",\"annotations\":["
+        "{\"qualified_name\":\"ann.rtl.rau.rau\",\"props\":{\"width\":7}},"
+        "{\"qualified_name\":\"ann.rtl.rau.gone\",\"props\":{\"width\":1}}]}");
+    ASSERT_NOT_NULL(resp);
+    free(resp);
+
+    /* Re-import one row with replace: the dropped elaborator row disappears,
+     * the profiler's rows are untouched. */
+    resp = cbm_mcp_handle_tool(
+        srv, "import_annotations",
+        "{\"project\":\"ann\",\"source\":\"elaborator\",\"replace\":true,\"annotations\":["
+        "{\"qualified_name\":\"ann.rtl.rau.rau\",\"props\":{\"width\":9}}]}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\\\"replaced\\\":2"));
+    ASSERT_NOT_NULL(strstr(resp, "\\\"total_for_source\\\":1"));
+    free(resp);
+
+    resp = cbm_mcp_handle_tool(srv, "get_annotations", "{\"project\":\"ann\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "profiler"));
+    ASSERT_NOT_NULL(strstr(resp, "991"));
+    ASSERT_NULL(strstr(resp, "ann.rtl.rau.gone"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_import_annotations_rejects_payload_without_rows) {
+    cbm_mcp_server_t *srv = annotation_server("ann");
+    ASSERT_NOT_NULL(srv);
+
+    char *resp = cbm_mcp_handle_tool(srv, "import_annotations", "{\"project\":\"ann\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(resp, "no 'annotations' array"));
+    free(resp);
+
+    resp = cbm_mcp_handle_tool(srv, "import_annotations",
+                               "{\"project\":\"ann\",\"path\":\"/nonexistent/ann.json\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(resp, "cannot read annotations payload"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_get_annotations_empty_project_hints) {
+    cbm_mcp_server_t *srv = annotation_server("ann");
+    ASSERT_NOT_NULL(srv);
+
+    char *resp = cbm_mcp_handle_tool(srv, "get_annotations", "{\"project\":\"ann\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(resp, "\\\"total\\\":0"));
+    ASSERT_NOT_NULL(strstr(resp, "no annotations yet"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* "this project has nothing" and "your filter matched nothing" are different
+ * answers — a project WITH annotations must never be reported as empty just
+ * because a source filter missed. */
+TEST(tool_get_annotations_distinguishes_empty_from_filtered_out) {
+    cbm_mcp_server_t *srv = annotation_server("ann");
+    ASSERT_NOT_NULL(srv);
+
+    char *resp = cbm_mcp_handle_tool(
+        srv, "import_annotations",
+        "{\"project\":\"ann\",\"source\":\"elaborator\",\"annotations\":["
+        "{\"qualified_name\":\"ann.rtl.rau.rau\",\"props\":{\"width\":7}}]}");
+    ASSERT_NOT_NULL(resp);
+    free(resp);
+
+    resp = cbm_mcp_handle_tool(srv, "get_annotations",
+                               "{\"project\":\"ann\",\"source\":\"no-such-source\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\\\"returned\\\":0"));
+    ASSERT_NOT_NULL(strstr(resp, "no annotation matches"));
+    ASSERT_NULL(strstr(resp, "no annotations yet"));
+    /* The roll-up still shows what the project DOES carry. */
+    ASSERT_NOT_NULL(strstr(resp, "elaborator"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_get_annotations_no_project) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    char *resp = cbm_mcp_handle_tool(srv, "get_annotations", "{}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "missing required argument: project"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
  *  IDLE STORE EVICTION
  * ══════════════════════════════════════════════════════════════════ */
 
@@ -7082,6 +7299,15 @@ SUITE(mcp) {
     RUN_TEST(tool_detect_changes_not_found_rich_error);
     RUN_TEST(tool_ingest_traces_basic);
     RUN_TEST(tool_ingest_traces_empty);
+
+    /* Node annotations */
+    RUN_TEST(tool_import_annotations_round_trips_via_get);
+    RUN_TEST(tool_import_annotations_warns_when_nothing_matches);
+    RUN_TEST(tool_import_annotations_replace_clears_only_its_source);
+    RUN_TEST(tool_import_annotations_rejects_payload_without_rows);
+    RUN_TEST(tool_get_annotations_empty_project_hints);
+    RUN_TEST(tool_get_annotations_distinguishes_empty_from_filtered_out);
+    RUN_TEST(tool_get_annotations_no_project);
 
     /* Query store read-only (data integrity) */
     RUN_TEST(readonly_query_does_not_mutate_db);

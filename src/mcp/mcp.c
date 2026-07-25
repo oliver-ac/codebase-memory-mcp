@@ -330,6 +330,11 @@ typedef struct {
     const char *input_schema; /* JSON string */
 } tool_def_t;
 
+/* Namespace an annotation payload falls back to when it identifies neither a
+ * "source" nor a "schema" (declared here so import_annotations' input schema can
+ * document the default rather than restate it). */
+#define ANN_DEFAULT_SOURCE "external"
+
 static const tool_def_t TOOLS[] = {
     {"index_repository", "Index repository",
      "Index a repository into the knowledge graph. "
@@ -441,7 +446,11 @@ static const tool_def_t TOOLS[] = {
      "(\"parse_partial\" = indexed but constructs in the flagged line ranges MAY be missing; "
      "or a skip phase) and detail (the line ranges / reason)). Example: MATCH (f:File) WHERE "
      "f.kind = \\\"parse_partial\\\" RETURN f.file_path, f.detail. Absence from this graph is "
-     "NOT a completeness guarantee.",
+     "NOT a completeness guarantee. "
+     "ANNOTATIONS: any props key loaded via import_annotations is queryable as a node property "
+     "too (e.g. RETURN n.hier_path, or WHERE n.width = \\\"7\\\"), which is the only way to reach "
+     "semantics the indexer cannot derive from syntax. Indexed properties always win on a name "
+     "clash; get_annotations lists what a project actually carries.",
      "{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"description\":\"Cypher "
      "query\"},\"project\":{\"type\":\"string\"},"
      "\"graph\":{\"type\":\"string\",\"enum\":[\"code\",\"missed\"],\"default\":\"code\","
@@ -497,7 +506,9 @@ static const tool_def_t TOOLS[] = {
      "full qualified_name (exact match) or short function name (returns suggestions if ambiguous). "
      "If the response carries a 'coverage_note', the file was only partially indexed — constructs "
      "in the noted line ranges may be missing from the graph (best-effort signal); prefer grep "
-     "there and treat the returned source as ground truth.",
+     "there and treat the returned source as ground truth. An 'annotations' field appears when "
+     "external metadata was imported for the node (import_annotations) — facts the source text "
+     "cannot show you, keyed by the annotating source.",
      "{\"type\":\"object\",\"properties\":{\"qualified_name\":{\"type\":\"string\",\"description\":"
      "\"Full qualified_name from search_graph, or short function name\"},\"project\":{"
      "\"type\":\"string\"},\"include_neighbors\":{"
@@ -637,6 +648,48 @@ static const tool_def_t TOOLS[] = {
      "\"object\",\"properties\":{\"caller\":{\"type\":\"string\"},\"callee\":{\"type\":\"string\"},"
      "\"count\":{\"type\":\"integer\"}},\"additionalProperties\":false}},\"project\":{\"type\":"
      "\"string\"}},\"required\":[\"traces\",\"project\"]}"},
+
+    {"import_annotations", "Import annotations",
+     "Attach EXTERNAL per-node metadata to an indexed project — facts a syntax tree cannot yield, "
+     "computed by a tool that actually understands the language's semantics: an elaborated "
+     "instance hierarchy, resolved bit widths / type layouts, config-resolved parameters, "
+     "profiler or coverage counts. Rows are keyed by the node's qualified_name (the only node "
+     "identifier stable across re-index) and namespaced by 'source', so several annotators "
+     "coexist and a re-index does not drop them. Read them back with get_annotations. "
+     "PAYLOAD: {\"annotations\":[{\"qualified_name\":\"<qn>\",\"props\":{...}}, ...]} — pass a "
+     "file via 'path' (the normal route; payloads are machine-generated and large) or inline via "
+     "'annotations'. VERIFY the response's 'matched_nodes': rows whose qualified_name matches no "
+     "node are stored but never join, which is the usual sign of a wrong key convention "
+     "(<project>.<relative-path-without-extension, '/'->'.'>.<symbol>).",
+     "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},"
+     "\"path\":{\"type\":\"string\",\"description\":\"Path to a JSON payload file. Preferred over "
+     "'annotations' for anything but a handful of rows.\"},"
+     "\"annotations\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{"
+     "\"qualified_name\":{\"type\":\"string\"},\"props\":{\"type\":\"object\"}},"
+     "\"required\":[\"qualified_name\"]},\"description\":\"Inline rows, used when 'path' is "
+     "absent.\"},"
+     "\"source\":{\"type\":\"string\",\"description\":\"Namespace for these annotations (e.g. "
+     "the producing tool's name). Defaults to the payload's own 'source'/'schema' field, else "
+     "\\\"" ANN_DEFAULT_SOURCE "\\\".\"},"
+     "\"replace\":{\"type\":\"boolean\",\"default\":false,\"description\":\"Delete every existing "
+     "row for this source before importing, so removed annotations disappear instead of "
+     "lingering. Default false = upsert only.\"}},"
+     "\"required\":[\"project\"]}"},
+
+    {"get_annotations", "Get annotations",
+     "Read the external per-node metadata loaded by import_annotations. Pass qualified_name for "
+     "one node's annotations; omit it to survey what is annotated (rows plus a per-source "
+     "roll-up in 'sources'). Filter by 'source' to read one annotator's view. Semantics that no "
+     "amount of grepping the source can produce — elaborated hierarchies, resolved widths — live "
+     "here, so check it before concluding the graph has nothing to say about a node.",
+     "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},"
+     "\"qualified_name\":{\"type\":\"string\",\"description\":\"Exact node qualified_name. Omit "
+     "to list annotations across the project.\"},"
+     "\"source\":{\"type\":\"string\",\"description\":\"Only annotations from this source.\"},"
+     "\"limit\":{\"type\":\"integer\",\"default\":50,\"description\":\"Max rows returned "
+     "(capped at 2000). 'total' counts what the given filters match and 'has_more' says "
+     "whether the limit truncated them; a single-node query also reports 'project_total'.\"}},"
+     "\"required\":[\"project\"]}"},
 };
 
 static const int TOOL_COUNT = sizeof(TOOLS) / sizeof(TOOLS[0]);
@@ -669,6 +722,10 @@ static const tool_annotation_def_t TOOL_ANNOTATIONS[] = {
     {"detect_changes", false, true, true, false},
     {"manage_adr", false, true, false, false},
     {"ingest_traces", false, false, false, false},
+    /* Idempotent: re-importing the same payload upserts to the same rows. Not
+     * destructive by default — replace=true only clears its own source. */
+    {"import_annotations", false, false, true, false},
+    {"get_annotations", false, true, true, false},
 };
 
 static const tool_annotation_def_t *mcp_tool_annotations(const char *name) {
@@ -691,6 +748,28 @@ static void mcp_add_json_schema(yyjson_mut_doc *doc, yyjson_mut_val *obj, const 
         }
         yyjson_doc_free(schema_doc);
     }
+}
+
+/* Add a stored annotation props JSON string to `obj` under `key` as real JSON.
+ * Falls back to the raw string when it does not parse, so a malformed row stays
+ * visible rather than being silently dropped. */
+static void ann_add_props(yyjson_mut_doc *doc, yyjson_mut_val *obj, const char *key,
+                          const char *props_json) {
+    if (!props_json || !props_json[0]) {
+        yyjson_mut_obj_add_null(doc, obj, key);
+        return;
+    }
+    yyjson_doc *pdoc = yyjson_read(props_json, strlen(props_json), 0);
+    if (pdoc) {
+        yyjson_mut_val *copied = yyjson_val_mut_copy(doc, yyjson_doc_get_root(pdoc));
+        if (copied) {
+            yyjson_mut_obj_add_val(doc, obj, key, copied);
+            yyjson_doc_free(pdoc);
+            return;
+        }
+        yyjson_doc_free(pdoc);
+    }
+    yyjson_mut_obj_add_strcpy(doc, obj, key, props_json);
 }
 
 static void mcp_add_tool_def(yyjson_mut_doc *doc, yyjson_mut_val *tools, int i) {
@@ -717,7 +796,7 @@ static bool mcp_tool_allowed(cbm_mcp_tool_profile_t profile, const char *name) {
     static const char *const analysis_tools[] = {
         "search_graph",     "query_graph",          "trace_path",     "get_code_snippet",
         "get_graph_schema", "get_architecture",     "search_code",    "list_projects",
-        "index_status",     "check_index_coverage", "detect_changes",
+        "index_status",     "check_index_coverage", "detect_changes", "get_annotations",
     };
     static const char *const scout_tools[] = {
         "search_graph",  "trace_path",   "get_code_snippet",     "get_architecture",
@@ -7312,6 +7391,20 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
 
     add_snippet_coverage_note(doc, root_obj, store, node);
 
+    /* External annotations DO earn their bytes here, unlike the property blob
+     * skipped above: they carry precisely what the printed source cannot tell
+     * you (an elaborated instance path, a resolved width), they are absent
+     * unless someone imported them, and no other per-node read path shows
+     * them. */
+    if (store && node->qualified_name && node->qualified_name[0] &&
+        cbm_store_has_annotations(store)) {
+        char *ann_json = cbm_store_annotations_merged_json(store, node->qualified_name);
+        if (ann_json) {
+            ann_add_props(doc, root_obj, "annotations", ann_json);
+            free(ann_json);
+        }
+    }
+
     char **nb_callers = NULL;
     int nb_caller_count = 0;
     char **nb_callees = NULL;
@@ -9231,6 +9324,417 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
     return result;
 }
 
+/* ── import_annotations / get_annotations ─────────────────────── */
+
+enum {
+    /* An annotation payload is machine-generated and can cover a whole repo
+     * (tens of thousands of nodes), so the ceiling is generous — but bounded,
+     * so a wrong --path (a core dump, a video) fails fast instead of being
+     * slurped into memory. */
+    ANN_MAX_PAYLOAD_BYTES = 64 * 1024 * 1024,
+    ANN_DEFAULT_LIMIT = 50,
+    ANN_MAX_LIMIT = 2000,
+};
+
+/* Read a whole annotation payload file. Returns a heap NUL-terminated buffer
+ * (caller frees) or NULL, with *err set to a static reason. */
+static char *ann_read_payload_file(const char *path, const char **err) {
+    *err = NULL;
+    FILE *fp = cbm_fopen(path, "rb");
+    if (!fp) {
+        *err = "cannot open path";
+        return NULL;
+    }
+    if (fseek(fp, 0, SEEK_END) != 0) {
+        (void)fclose(fp);
+        *err = "cannot size path";
+        return NULL;
+    }
+    long sz = ftell(fp);
+    if (sz <= 0) {
+        (void)fclose(fp);
+        *err = "path is empty";
+        return NULL;
+    }
+    if (sz > ANN_MAX_PAYLOAD_BYTES) {
+        (void)fclose(fp);
+        *err = "payload exceeds 64 MB";
+        return NULL;
+    }
+    (void)fseek(fp, 0, SEEK_SET);
+    char *buf = malloc((size_t)sz + SKIP_ONE);
+    if (!buf) {
+        (void)fclose(fp);
+        *err = "out of memory";
+        return NULL;
+    }
+    size_t n = fread(buf, SKIP_ONE, (size_t)sz, fp);
+    buf[n] = '\0';
+    (void)fclose(fp);
+    return buf;
+}
+
+/* The annotation array of a payload: either the top-level array itself, or the
+ * "annotations" member of the wrapper object the producers emit. */
+static yyjson_val *ann_payload_rows(yyjson_val *root) {
+    if (!root) {
+        return NULL;
+    }
+    if (yyjson_is_arr(root)) {
+        return root;
+    }
+    yyjson_val *rows = yyjson_obj_get(root, "annotations");
+    return (rows && yyjson_is_arr(rows)) ? rows : NULL;
+}
+
+/* Resolve the source namespace: explicit arg wins, then the payload's own
+ * "source"/"schema" self-identification, then a neutral default. */
+static const char *ann_resolve_source(const char *arg_source, yyjson_val *root) {
+    if (arg_source && arg_source[0]) {
+        return arg_source;
+    }
+    if (root && yyjson_is_obj(root)) {
+        yyjson_val *v = yyjson_obj_get(root, "source");
+        if (v && yyjson_is_str(v) && yyjson_get_str(v)[0]) {
+            return yyjson_get_str(v);
+        }
+        v = yyjson_obj_get(root, "schema");
+        if (v && yyjson_is_str(v) && yyjson_get_str(v)[0]) {
+            return yyjson_get_str(v);
+        }
+    }
+    return ANN_DEFAULT_SOURCE;
+}
+
+static char *handle_import_annotations(cbm_mcp_server_t *srv, const char *args) {
+    char *project = get_project_arg(args);
+    char *path = cbm_mcp_get_string_arg(args, "path");
+    char *arg_source = cbm_mcp_get_string_arg(args, "source");
+    bool replace = cbm_mcp_get_bool_arg(args, "replace");
+
+    /* The payload is either read from `path` or taken inline from the args. */
+    char *file_buf = NULL;
+    const char *payload = NULL;
+    if (path && path[0]) {
+        const char *read_err = NULL;
+        file_buf = ann_read_payload_file(path, &read_err);
+        if (!file_buf) {
+            char msg[CBM_SZ_512];
+            snprintf(msg, sizeof(msg), "cannot read annotations payload '%s': %s", path,
+                     read_err ? read_err : "unknown error");
+            char *res = cbm_mcp_text_result(msg, true);
+            free(project);
+            free(path);
+            free(arg_source);
+            return res;
+        }
+        payload = file_buf;
+    } else {
+        payload = args; /* inline: the args object itself carries "annotations" */
+    }
+
+    yyjson_doc *pdoc = payload ? yyjson_read(payload, strlen(payload), 0) : NULL;
+    yyjson_val *proot = pdoc ? yyjson_doc_get_root(pdoc) : NULL;
+    yyjson_val *rows = ann_payload_rows(proot);
+    if (!rows) {
+        const char *why =
+            pdoc ? "payload has no 'annotations' array (expected {\"annotations\":[{"
+                   "\"qualified_name\":...,\"props\":{...}}, ...]} or a bare array)"
+                 : "payload is not valid JSON";
+        char *res = cbm_mcp_text_result(why, true);
+        if (pdoc) {
+            yyjson_doc_free(pdoc);
+        }
+        free(file_buf);
+        free(project);
+        free(path);
+        free(arg_source);
+        return res;
+    }
+
+    const char *source = ann_resolve_source(arg_source, proot);
+
+    /* Payload rows → store rows. props is re-serialized from the parsed JSON
+     * (not copied verbatim) so what lands in the table is always valid JSON. */
+    size_t row_count = yyjson_arr_size(rows);
+    cbm_annotation_t *store_rows = row_count ? calloc(row_count, sizeof(*store_rows)) : NULL;
+    char **owned_props = row_count ? calloc(row_count, sizeof(char *)) : NULL;
+    int prepared = 0;
+    int skipped_unkeyable = 0;
+    if (row_count && (!store_rows || !owned_props)) {
+        free(store_rows);
+        free(owned_props);
+        yyjson_doc_free(pdoc);
+        free(file_buf);
+        free(project);
+        free(path);
+        free(arg_source);
+        return cbm_mcp_text_result("out of memory preparing annotation rows", true);
+    }
+
+    size_t idx = 0;
+    size_t max = 0;
+    yyjson_val *row = NULL;
+    yyjson_arr_foreach(rows, idx, max, row) {
+        if (!yyjson_is_obj(row)) {
+            skipped_unkeyable++;
+            continue;
+        }
+        yyjson_val *qn_val = yyjson_obj_get(row, "qualified_name");
+        const char *qn = (qn_val && yyjson_is_str(qn_val)) ? yyjson_get_str(qn_val) : NULL;
+        if (!qn || !qn[0]) {
+            skipped_unkeyable++;
+            continue;
+        }
+        yyjson_val *props_val = yyjson_obj_get(row, "props");
+        char *props_str = NULL;
+        if (props_val && (yyjson_is_obj(props_val) || yyjson_is_arr(props_val))) {
+            props_str = yyjson_val_write(props_val, 0, NULL);
+        }
+        owned_props[prepared] = props_str; /* NULL → stored as "{}" */
+        store_rows[prepared].qualified_name = qn;
+        store_rows[prepared].source = source;
+        store_rows[prepared].props_json = props_str;
+        store_rows[prepared].updated_at = NULL; /* stamped by the store */
+        prepared++;
+    }
+
+    cbm_store_t *resolved = resolve_store(srv, project);
+    cbm_store_t *store = resolved;
+    cbm_store_t *owned_rw = NULL;
+    if (resolved) {
+        /* resolve_store hands back a READ-ONLY handle for file-backed projects
+         * (query tools must not mutate the DB). Importing writes, so reopen the
+         * same file read-write — the project is already verified to exist, so
+         * this cannot create a ghost DB. An in-memory/embedded store
+         * (db_path == NULL) is already writable. */
+        const char *resolved_db_path = cbm_store_db_path(resolved);
+        if (resolved_db_path) {
+            owned_rw = cbm_store_open_path(resolved_db_path);
+            store = owned_rw;
+        }
+    }
+    if (!store) {
+        char *err = build_no_store_error(project);
+        char *res = cbm_mcp_text_result(err, true);
+        free(err);
+        for (int i = 0; i < prepared; i++) {
+            free(owned_props[i]);
+        }
+        free(owned_props);
+        free(store_rows);
+        yyjson_doc_free(pdoc);
+        free(file_buf);
+        free(project);
+        free(path);
+        free(arg_source);
+        return res;
+    }
+
+    int replaced = 0;
+    if (replace) {
+        replaced = cbm_store_annotations_delete(store, source);
+        if (replaced < 0) {
+            replaced = 0;
+        }
+    }
+
+    int matched = 0;
+    int rc = cbm_store_annotations_upsert(store, project, store_rows, prepared, &matched);
+    int total = cbm_store_annotations_count(store, source);
+    const char *store_err = (rc == CBM_STORE_OK) ? NULL : cbm_store_error(store);
+    char store_err_copy[CBM_SZ_512];
+    store_err_copy[0] = '\0';
+    if (store_err) {
+        snprintf(store_err_copy, sizeof(store_err_copy), "%s", store_err);
+    }
+
+    /* Flush the WAL so a separate read-only connection (the next get_annotations
+     * or the UI) sees the rows immediately. */
+    cbm_store_checkpoint(store);
+    if (owned_rw) {
+        cbm_store_close(owned_rw);
+    }
+
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    bool is_error = (rc != CBM_STORE_OK);
+
+    if (is_error) {
+        yyjson_mut_obj_add_str(doc, root, "status", "error");
+        yyjson_mut_obj_add_strcpy(doc, root, "error",
+                                  store_err_copy[0] ? store_err_copy : "annotation import failed");
+    } else {
+        yyjson_mut_obj_add_str(doc, root, "status", "ok");
+    }
+    yyjson_mut_obj_add_strcpy(doc, root, "project", project ? project : "");
+    yyjson_mut_obj_add_strcpy(doc, root, "source", source);
+    yyjson_mut_obj_add_int(doc, root, "received", (int64_t)row_count);
+    yyjson_mut_obj_add_int(doc, root, "imported", prepared);
+    yyjson_mut_obj_add_int(doc, root, "skipped_unkeyable", skipped_unkeyable);
+    yyjson_mut_obj_add_int(doc, root, "replaced", replaced);
+    yyjson_mut_obj_add_int(doc, root, "matched_nodes", matched);
+    yyjson_mut_obj_add_int(doc, root, "total_for_source", total);
+
+    /* A payload whose qualified_names match nothing is stored but useless — say
+     * so, rather than reporting a clean success the caller cannot act on. */
+    if (!is_error && prepared > 0 && matched == 0) {
+        yyjson_mut_obj_add_str(
+            doc, root, "warning",
+            "no imported qualified_name matches a node in this project — the rows are stored "
+            "but will never join. Check the qualified_name convention: "
+            "<project>.<relative-path-without-extension, '/' replaced by '.'>.<symbol>. "
+            "Confirm real keys with search_graph(detail=\"ids\") or "
+            "query_graph(\"MATCH (n) RETURN n.qualified_name LIMIT 5\").");
+    }
+    if (!is_error && proot && yyjson_is_obj(proot)) {
+        yyjson_val *pproj = yyjson_obj_get(proot, "project");
+        if (pproj && yyjson_is_str(pproj) && project &&
+            strcmp(yyjson_get_str(pproj), project) != 0) {
+            char note[CBM_SZ_512];
+            snprintf(note, sizeof(note),
+                     "payload was generated for project '%s' but imported into '%s' — "
+                     "qualified_names are project-prefixed, so verify matched_nodes",
+                     yyjson_get_str(pproj), project);
+            yyjson_mut_obj_add_strcpy(doc, root, "project_mismatch", note);
+        }
+    }
+
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+
+    for (int i = 0; i < prepared; i++) {
+        free(owned_props[i]);
+    }
+    free(owned_props);
+    free(store_rows);
+    yyjson_doc_free(pdoc);
+    free(file_buf);
+    free(project);
+    free(path);
+    free(arg_source);
+
+    char *result = cbm_mcp_text_result(json, is_error);
+    free(json);
+    return result;
+}
+
+static char *handle_get_annotations(cbm_mcp_server_t *srv, const char *args) {
+    char *project = get_project_arg(args);
+    char *qn = cbm_mcp_get_string_arg(args, "qualified_name");
+    char *source = cbm_mcp_get_string_arg(args, "source");
+    int limit = cbm_mcp_get_int_arg(args, "limit", ANN_DEFAULT_LIMIT);
+    if (limit <= 0) {
+        limit = ANN_DEFAULT_LIMIT;
+    }
+    if (limit > ANN_MAX_LIMIT) {
+        limit = ANN_MAX_LIMIT;
+    }
+
+    cbm_store_t *store = resolve_store(srv, project);
+    if (!store) {
+        char *err = build_no_store_error(project);
+        char *res = cbm_mcp_text_result(err, true);
+        free(err);
+        free(project);
+        free(qn);
+        free(source);
+        return res;
+    }
+
+    cbm_annotation_t *rows = NULL;
+    int count = 0;
+    (void)cbm_store_annotations_get(store, qn, source, limit, &rows, &count);
+
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_strcpy(doc, root, "project", project ? project : "");
+    if (qn && qn[0]) {
+        yyjson_mut_obj_add_strcpy(doc, root, "qualified_name", qn);
+    }
+    if (source && source[0]) {
+        yyjson_mut_obj_add_strcpy(doc, root, "source", source);
+    }
+
+    /* `total` counts what the CALLER'S filters match, so it is comparable with
+     * `returned` and with has_more. A single-node query is bounded by the number
+     * of annotating sources, well under any limit, so its matches are exactly
+     * what was returned — reporting the project-wide figure there would read as
+     * "44 more rows to page through" when there are none. The wider figure is
+     * still useful, so it ships under its own name. */
+    int source_total = cbm_store_annotations_count(store, source);
+    bool by_node = (qn && qn[0]);
+    int total = by_node ? count : source_total;
+    yyjson_mut_obj_add_int(doc, root, "total", total);
+    yyjson_mut_obj_add_int(doc, root, "returned", count);
+    yyjson_mut_obj_add_bool(doc, root, "has_more", count < total);
+    if (by_node) {
+        yyjson_mut_obj_add_int(doc, root, "project_total", source_total);
+    }
+
+    yyjson_mut_val *arr = yyjson_mut_arr(doc);
+    for (int i = 0; i < count; i++) {
+        yyjson_mut_val *entry = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_strcpy(doc, entry, "qualified_name",
+                                  rows[i].qualified_name ? rows[i].qualified_name : "");
+        yyjson_mut_obj_add_strcpy(doc, entry, "source", rows[i].source ? rows[i].source : "");
+        ann_add_props(doc, entry, "props", rows[i].props_json);
+        if (rows[i].updated_at && rows[i].updated_at[0]) {
+            yyjson_mut_obj_add_strcpy(doc, entry, "updated_at", rows[i].updated_at);
+        }
+        yyjson_mut_arr_add_val(arr, entry);
+    }
+    yyjson_mut_obj_add_val(doc, root, "annotations", arr);
+
+    /* Without a qn filter this is a "what is annotated here?" call — the source
+     * roll-up answers it in one line instead of paging the rows. */
+    if (!qn || !qn[0]) {
+        char **names = NULL;
+        int *counts = NULL;
+        int src_count = 0;
+        if (cbm_store_annotations_sources(store, &names, &counts, &src_count) == CBM_STORE_OK) {
+            yyjson_mut_val *sources = yyjson_mut_arr(doc);
+            for (int i = 0; i < src_count; i++) {
+                yyjson_mut_val *s_entry = yyjson_mut_obj(doc);
+                yyjson_mut_obj_add_strcpy(doc, s_entry, "source", names[i] ? names[i] : "");
+                yyjson_mut_obj_add_int(doc, s_entry, "count", counts[i]);
+                yyjson_mut_arr_add_val(sources, s_entry);
+                free(names[i]);
+            }
+            free(names);
+            free(counts);
+            yyjson_mut_obj_add_val(doc, root, "sources", sources);
+        }
+    }
+
+    /* "nothing here" and "nothing matching your filters" are different answers,
+     * and both counts above are filtered — so ask the store for the unfiltered
+     * truth before claiming the project has no annotations at all. */
+    if (count == 0) {
+        bool project_has_any = cbm_store_has_annotations(store);
+        yyjson_mut_obj_add_str(doc, root, "hint",
+                               project_has_any
+                                   ? "no annotation matches this qualified_name/source — "
+                                     "list what exists by calling without both filters"
+                                   : "this project has no annotations yet — load some with "
+                                     "import_annotations(project=..., path=<payload.json>)");
+    }
+
+    cbm_store_free_annotations(rows, count);
+
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    free(project);
+    free(qn);
+    free(source);
+
+    char *result = cbm_mcp_text_result(json, false);
+    free(json);
+    return result;
+}
+
 /* ── ingest_traces ────────────────────────────────────────────── */
 
 static char *handle_ingest_traces(cbm_mcp_server_t *srv, const char *args) {
@@ -9324,6 +9828,12 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
     }
     if (strcmp(tool_name, "ingest_traces") == 0) {
         return handle_ingest_traces(srv, args_json);
+    }
+    if (strcmp(tool_name, "import_annotations") == 0) {
+        return handle_import_annotations(srv, args_json);
+    }
+    if (strcmp(tool_name, "get_annotations") == 0) {
+        return handle_get_annotations(srv, args_json);
     }
     char msg[CBM_SZ_256];
     snprintf(msg, sizeof(msg), "unknown tool: %s", tool_name);

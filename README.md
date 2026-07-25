@@ -16,7 +16,7 @@
 
 **The fastest and most efficient code intelligence engine for AI coding agents.** Full-indexes an average repository in milliseconds, the Linux kernel (28M LOC, 75K files) in 3 minutes. Answers structural queries in under 1ms. Ships as a single static binary for macOS, Linux, and Windows — download, run `install`, done.
 
-High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-sitter/) AST analysis across all 158 languages, enhanced with [**Hybrid LSP** semantic type resolution](#hybrid-lsp) for Python, TypeScript / JavaScript / JSX / TSX, PHP, C#, Go, C, C++, Java, Kotlin, Rust, and Perl — producing a persistent knowledge graph of functions, classes, call chains, HTTP routes, and cross-service links. 15 MCP tools. Zero dependencies. Plug and play across 43 supported automatic/conditional client surfaces.
+High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-sitter/) AST analysis across all 158 languages, enhanced with [**Hybrid LSP** semantic type resolution](#hybrid-lsp) for Python, TypeScript / JavaScript / JSX / TSX, PHP, C#, Go, C, C++, Java, Kotlin, Rust, and Perl — producing a persistent knowledge graph of functions, classes, call chains, HTTP routes, and cross-service links. 17 MCP tools. Zero dependencies. Plug and play across 43 supported automatic/conditional client surfaces.
 
 > **Research** — The design and benchmarks behind this project are described in the preprint [*Codebase-Memory: Tree-Sitter-Based Knowledge Graphs for LLM Code Exploration via MCP*](https://arxiv.org/abs/2603.27277) (arXiv:2603.27277). Evaluated across 31 real-world repositories: 83% answer quality, 10× fewer tokens, 2.1× fewer tool calls vs. file-by-file exploration.
 
@@ -37,7 +37,7 @@ High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-si
 - **43 supported automatic/conditional client surfaces** — `install` configures detected clients and safely activates conditional clients only when their documented platform, marker, or explicit existing config path is present. See [Multi-Agent Support](#multi-agent-support) for the complete matrix and manual/UI-only boundaries.
 - **Built-in graph visualization** — 3D interactive UI at `localhost:9749` (optional UI binary variant).
 - **Infrastructure-as-code indexing** — Dockerfiles, Kubernetes manifests, and Kustomize overlays indexed as graph nodes with cross-references. `Resource` nodes for K8s kinds, `Module` nodes for Kustomize overlays with `IMPORTS` edges to referenced resources.
-- **15 MCP tools** — search, trace, architecture, impact analysis, targeted index-coverage checks, Cypher queries, dead code detection, cross-service HTTP linking, ADR management, and more.
+- **17 MCP tools** — search, trace, architecture, impact analysis, targeted index-coverage checks, Cypher queries, dead code detection, cross-service HTTP linking, ADR management, external node annotations, and more.
 
 ## Quick Start
 
@@ -152,6 +152,7 @@ Removes owned agent config entries, skills, hooks, instructions, and the install
 ### Graph & analysis
 - **Architecture overview**: `get_architecture` returns languages, packages, entry points, routes, hotspots, boundaries, layers, and clusters in a single call
 - **Architecture Decision Records**: `manage_adr` persists architectural decisions across sessions
+- **External node annotations**: `import_annotations` attaches metadata a syntax tree cannot yield — an elaborated hardware instance hierarchy, resolved type widths, profiler counts — keyed by `qualified_name` so it survives re-index; readable via `get_annotations`, as node properties in Cypher, and on `get_code_snippet`
 - **Louvain community detection**: Discovers functional modules by clustering call edges
 - **Git diff impact mapping**: `detect_changes` maps uncommitted changes to affected symbols with risk classification
 - **Call graph**: Resolves function calls across files and packages (import-aware, type-inferred)
@@ -364,7 +365,7 @@ Add to `~/.claude.json` (user scope) or project `.mcp.json`:
 }
 ```
 
-Restart your agent. Verify with `/mcp` — you should see `codebase-memory-mcp` with 15 tools.
+Restart your agent. Verify with `/mcp` — you should see `codebase-memory-mcp` with 17 tools.
 
 </details>
 
@@ -559,6 +560,8 @@ codebase-memory-mcp cli --raw search_graph '{"project": "my-project", "label": "
 | `search_code` | Grep-like text search within indexed project files. |
 | `manage_adr` | CRUD for Architecture Decision Records. |
 | `ingest_traces` | Ingest runtime traces to validate HTTP_CALLS edges. |
+| `import_annotations` | Attach external per-node metadata (keyed by `qualified_name`, namespaced by `source`). Survives re-index. |
+| `get_annotations` | Read imported annotations for one node, or survey a project's annotation sources. |
 
 ## Graph Data Model
 
@@ -706,7 +709,7 @@ Also supported (not yet benchmarked): Ada, Agda, Apex, Assembly (NASM), Astro, A
 ```
 src/
   main.c              Entry point (MCP stdio server + CLI + install/update/config)
-  mcp/                MCP server (15 tools, JSON-RPC 2.0, session detection, auto-index)
+  mcp/                MCP server (17 tools, JSON-RPC 2.0, session detection, auto-index)
   cli/                Install/uninstall/update/config (43 client surfaces, hooks, instructions)
   store/              SQLite graph storage (nodes, edges, traversal, search, Louvain)
   pipeline/           Multi-pass indexing (structure → definitions → calls → HTTP links → config → tests)

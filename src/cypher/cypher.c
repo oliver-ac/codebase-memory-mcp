@@ -2232,6 +2232,21 @@ static const char *node_prop(const cbm_node_t *n, const char *prop, cbm_store_t 
             return v;
         }
     }
+    /* Fall back to EXTERNAL annotations (import_annotations), so a fact only a
+     * semantic tool could compute — an elaborated hier_path, a resolved width —
+     * reads exactly like a persisted property: RETURN n.hier_path,
+     * WHERE n.width = '7'. Deliberately consulted AFTER the real ones, so an
+     * annotation can never shadow an indexed property and no existing query
+     * changes meaning; and gated on has_annotations so un-annotated projects
+     * pay one index probe, not a lookup per node per property. */
+    if (store && n->qualified_name && n->qualified_name[0] && cbm_store_has_annotations(store)) {
+        if (cbm_store_annotation_prop(store, n->qualified_name, prop, out, CBM_SZ_512) ==
+            CBM_STORE_OK) {
+            if (out[0]) {
+                return out;
+            }
+        }
+    }
     /* WITH aggregation carries a node group var by id + name only (the group key
      * is the node name), so every other property is absent on the stub. Detect
      * the stub (id set, but the full string fields were never populated) and

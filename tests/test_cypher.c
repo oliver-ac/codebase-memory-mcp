@@ -503,6 +503,71 @@ TEST(cypher_exec_where_eq) {
     PASS();
 }
 
+/* Imported annotations (import_annotations) read like node properties, so a
+ * fact only a semantic tool can compute is queryable in Cypher. */
+TEST(cypher_exec_annotation_prop_is_queryable) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+
+    /* Before any import, an unknown property is simply empty. */
+    ASSERT_EQ(cbm_cypher_execute(
+                  s, "MATCH (f:Function) WHERE f.hier_path = \"ox.ooo.rau\" RETURN f.name", "test",
+                  0, &r),
+              0);
+    ASSERT_EQ(r.row_count, 0);
+    cbm_cypher_result_free(&r);
+
+    const cbm_annotation_t rows[] = {
+        {.qualified_name = "test.HandleOrder",
+         .source = "elaborator",
+         .props_json = "{\"hier_path\":\"ox.ooo.rau\",\"width\":7}"},
+    };
+    ASSERT_EQ(cbm_store_annotations_upsert(s, "test", rows, 1, NULL), CBM_STORE_OK);
+
+    memset(&r, 0, sizeof(r));
+    ASSERT_EQ(cbm_cypher_execute(
+                  s, "MATCH (f:Function) WHERE f.hier_path = \"ox.ooo.rau\" RETURN f.name, "
+                     "f.hier_path, f.width",
+                  "test", 0, &r),
+              0);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_EQ(r.col_count, 3);
+    ASSERT_STR_EQ(r.rows[0][0], "HandleOrder");
+    ASSERT_STR_EQ(r.rows[0][1], "ox.ooo.rau");
+    ASSERT_STR_EQ(r.rows[0][2], "7"); /* numeric props project as their text */
+    cbm_cypher_result_free(&r);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+/* An annotation must never shadow a real node property — otherwise importing
+ * one could silently change what an existing query means. */
+TEST(cypher_exec_annotation_does_not_shadow_node_property) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+
+    const cbm_annotation_t rows[] = {
+        {.qualified_name = "test.HandleOrder",
+         .source = "elaborator",
+         .props_json = "{\"name\":\"NOT_THE_NAME\",\"file_path\":\"nowhere.sv\"}"},
+    };
+    ASSERT_EQ(cbm_store_annotations_upsert(s, "test", rows, 1, NULL), CBM_STORE_OK);
+
+    ASSERT_EQ(cbm_cypher_execute(s,
+                                 "MATCH (f:Function) WHERE f.name = \"HandleOrder\" "
+                                 "RETURN f.name, f.file_path",
+                                 "test", 0, &r),
+              0);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(r.rows[0][0], "HandleOrder");
+    ASSERT_STR_EQ(r.rows[0][1], "handler.go");
+    cbm_cypher_result_free(&r);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 /* #874: coalesce(var.prop, literal) in WHERE — null-safe numeric filters
  * for audit queries over OPTIONAL graph properties. The parser rejected the
  * call outright ("unexpected operator"); RETURN-side coalesce already
@@ -3088,6 +3153,8 @@ SUITE(cypher) {
     RUN_TEST(cypher_issue252_tointeger);
     RUN_TEST(cypher_issue305_count_star_alias);
     RUN_TEST(cypher_exec_where_eq);
+    RUN_TEST(cypher_exec_annotation_prop_is_queryable);
+    RUN_TEST(cypher_exec_annotation_does_not_shadow_node_property);
     RUN_TEST(cypher_exec_varlength_path_semantics_issue797);
     RUN_TEST(cypher_exec_where_coalesce_issue874);
     RUN_TEST(cypher_exec_where_regex);

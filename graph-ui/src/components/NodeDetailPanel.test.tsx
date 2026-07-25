@@ -1,16 +1,33 @@
 /* @vitest-environment jsdom */
 import "@testing-library/jest-dom/vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { NodeDetailPanel } from "./NodeDetailPanel";
 import type { GraphNode, RepoInfo } from "../lib/types";
 
-/* Mock the RPC layer so "Show code" resolves without a backend. */
+/* Mock the RPC layer so the panel resolves without a backend. */
 const callToolMock = vi.fn();
 vi.mock("../api/rpc", () => ({
   callTool: (...args: unknown[]) => callToolMock(...args),
   RpcError: class extends Error {},
 }));
+
+/* Dispatch replies BY TOOL NAME rather than by call order: the panel makes an
+ * eager get_annotations call on mount plus a lazy get_code_snippet on click, and
+ * an order-based mock would hand one tool's reply to the other. */
+function mockTools(replies: Record<string, unknown>) {
+  callToolMock.mockImplementation((tool: string) =>
+    tool in replies
+      ? Promise.resolve(replies[tool])
+      : Promise.reject(new Error(`unexpected tool: ${tool}`)),
+  );
+}
+
+beforeEach(() => {
+  callToolMock.mockReset();
+  /* Default: an engine that has no annotations for this node. */
+  mockTools({ get_annotations: { annotations: [] } });
+});
 
 const NODE: GraphNode = {
   id: 7,
@@ -43,7 +60,10 @@ describe("NodeDetailPanel code preview + deep-link", () => {
   it("renders fetched source as escaped text, never as injected HTML", async () => {
     /* A payload that would execute if the code were rendered as raw HTML. */
     const payload = "<script>window.__pwned = true;</script>\nconst answer = 42;";
-    callToolMock.mockResolvedValueOnce({ source: payload });
+    mockTools({
+      get_code_snippet: { source: payload },
+      get_annotations: { annotations: [] },
+    });
 
     const { container } = render(
       <NodeDetailPanel
@@ -92,5 +112,74 @@ describe("NodeDetailPanel code preview + deep-link", () => {
     /* Hardening attributes for target=_blank. */
     expect(link.getAttribute("rel")).toBe("noopener noreferrer");
     expect(link.getAttribute("target")).toBe("_blank");
+  });
+});
+
+describe("NodeDetailPanel annotations", () => {
+  it("shows imported annotations without the user asking for them", async () => {
+    mockTools({
+      get_annotations: {
+        annotations: [
+          {
+            source: "rtl-resource-dict.cbm-annotations/v1",
+            props: {
+              hier_path: "ox.rename_alloc.free_list",
+              n_instances: 1,
+              members: ["IDLE", "BUSY"],
+            },
+          },
+        ],
+      },
+    });
+
+    render(
+      <NodeDetailPanel
+        node={NODE}
+        allNodes={[NODE]}
+        allEdges={[]}
+        project="demo"
+        repoInfo={REPO}
+        onClose={() => {}}
+        onNavigate={() => {}}
+      />,
+    );
+
+    /* No click: the block appears from the eager fetch. */
+    expect(await screen.findByTestId("node-annotations")).toBeInTheDocument();
+    expect(screen.getByText("hier_path")).toBeInTheDocument();
+    expect(screen.getByText("ox.rename_alloc.free_list")).toBeInTheDocument();
+    expect(screen.getByText("rtl-resource-dict.cbm-annotations/v1")).toBeInTheDocument();
+    /* A structured prop renders as JSON, never as "[object Object]". */
+    expect(screen.getByText('["IDLE","BUSY"]')).toBeInTheDocument();
+    expect(screen.queryByText("[object Object]")).toBeNull();
+
+    expect(callToolMock).toHaveBeenCalledWith("get_annotations", {
+      project: "demo",
+      qualified_name: "app::render",
+    });
+  });
+
+  it("renders nothing when the engine has no annotations feature", async () => {
+    /* An engine without the tool rejects the call — the panel must stay usable
+     * and simply omit the block, not surface an error. */
+    callToolMock.mockImplementation(() =>
+      Promise.reject(new Error("unknown tool: get_annotations")),
+    );
+
+    render(
+      <NodeDetailPanel
+        node={NODE}
+        allNodes={[NODE]}
+        allEdges={[]}
+        project="demo"
+        repoInfo={REPO}
+        onClose={() => {}}
+        onNavigate={() => {}}
+      />,
+    );
+
+    expect(await screen.findByText(NODE.name)).toBeInTheDocument();
+    expect(screen.queryByTestId("node-annotations")).toBeNull();
+    expect(screen.queryByText(/unknown tool/)).toBeNull();
   });
 });

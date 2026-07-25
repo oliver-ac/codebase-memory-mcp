@@ -26,6 +26,26 @@ interface SnippetResult {
   end_line?: number;
 }
 
+/* External per-node metadata loaded via import_annotations: facts no syntax tree
+ * can yield — an elaborated hardware instance path, a resolved width, a profiler
+ * count — namespaced by the tool that produced them. */
+interface AnnotationRow {
+  source?: string;
+  props?: Record<string, unknown>;
+}
+
+interface AnnotationsResult {
+  annotations?: AnnotationRow[];
+}
+
+/* One line per annotation value. Props are arbitrary JSON, so a value may be a
+ * nested object or array (a struct's field list, an enum's members); stringify
+ * those instead of printing "[object Object]". */
+function annotationValue(v: unknown): string {
+  if (v === null || v === undefined) return "";
+  return typeof v === "object" ? JSON.stringify(v) : String(v);
+}
+
 function lineSuffix(node: GraphNode): string {
   if (!node.start_line) return "";
   const end = node.end_line && node.end_line !== node.start_line ? `-L${node.end_line}` : "";
@@ -57,6 +77,7 @@ export function NodeDetailPanel({
   const [code, setCode] = useState<string | null>(null);
   const [codeLoading, setCodeLoading] = useState(false);
   const [codeError, setCodeError] = useState<string | null>(null);
+  const [annotations, setAnnotations] = useState<AnnotationRow[]>([]);
 
   /* Reset the fetched code whenever the selected node changes. */
   useEffect(() => {
@@ -64,6 +85,35 @@ export function NodeDetailPanel({
     setCodeError(null);
     setCodeLoading(false);
   }, [node.id]);
+
+  /* Annotations load EAGERLY, unlike the code snippet: a snippet can be hundreds
+   * of lines (hence the explicit "Show code"), while a node's annotations are a
+   * handful of scalars behind one indexed lookup — and they are the facts you
+   * cannot recover by reading the source, so making the user ask for them
+   * defeats the point.
+   *
+   * Failures are swallowed on purpose: an engine without the annotations feature
+   * rejects the tool outright, and a node simply having none is the common case.
+   * Neither is worth an error in the panel — the block just doesn't render. */
+  useEffect(() => {
+    let cancelled = false;
+    setAnnotations([]);
+    if (!project || !node.qualified_name) return;
+    void (async () => {
+      try {
+        const res = await callTool<AnnotationsResult>("get_annotations", {
+          project,
+          qualified_name: node.qualified_name,
+        });
+        if (!cancelled) setAnnotations(res.annotations ?? []);
+      } catch {
+        if (!cancelled) setAnnotations([]);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [node.id, node.qualified_name, project]);
 
   const canFetchCode = Boolean(project && node.qualified_name);
   const ghUrl = githubUrl(node, repoInfo);
@@ -188,9 +238,38 @@ export function NodeDetailPanel({
         </div>
       </div>
 
-      {/* Connections */}
+      {/* Annotations + connections */}
       <ScrollArea className="flex-1 min-h-0">
         <div className="px-4 py-3 space-y-4">
+          {annotations.length > 0 && (
+            <div data-testid="node-annotations">
+              <p className="text-[11px] font-medium text-foreground/40 mb-2">
+                Annotations
+              </p>
+              {annotations.map((ann, i) => (
+                <div
+                  key={`${ann.source ?? "annotation"}-${i}`}
+                  className="mb-2 rounded-md border border-emerald-400/25 bg-emerald-400/[0.05] p-2.5"
+                >
+                  {ann.source && (
+                    <p className="text-[9.5px] text-emerald-300/60 font-mono mb-1.5 break-all">
+                      {ann.source}
+                    </p>
+                  )}
+                  <dl className="grid grid-cols-[minmax(0,auto)_minmax(0,1fr)] gap-x-3 gap-y-1">
+                    {Object.entries(ann.props ?? {}).map(([k, v]) => (
+                      <div key={k} className="contents">
+                        <dt className="text-[10.5px] text-foreground/35 font-mono">{k}</dt>
+                        <dd className="text-[10.5px] text-foreground/80 font-mono break-all">
+                          {annotationValue(v)}
+                        </dd>
+                      </div>
+                    ))}
+                  </dl>
+                </div>
+              ))}
+            </div>
+          )}
           {outbound.length > 0 && (
             <ConnectionSection title="References" count={outbound.length} icon="→" groups={groupByType(outbound)} onNavigate={onNavigate} />
           )}

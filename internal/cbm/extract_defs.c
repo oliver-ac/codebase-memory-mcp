@@ -6864,6 +6864,153 @@ static void extract_sv_parameters(CBMExtractCtx *ctx, TSNode node) {
     }
 }
 
+/* ── SystemVerilog/Verilog: recover declarations the grammar lost ──────────
+ *
+ * The tree-sitter SV grammar cannot parse a call inside a packed dimension:
+ * `logic [$clog2(W)-1:0] x;` and `logic [get_width(W)-1:0] x;` both yield an
+ * ERROR node (one-construct fixtures in tests/fixtures/sv_partial/ pin this).
+ * That idiom is everywhere in real RTL, so error regions accumulate, and past
+ * some density tree-sitter's recovery stops reducing `module … endmodule` at all
+ * and wraps the WHOLE file in one ERROR. The module then has no node — measured
+ * on a 947-file design, that silently cost ~228 module declarations and took
+ * their params, types and functions with them.
+ *
+ * When that happens, fall back to a text scan for declaration headers.
+ * Deliberately narrow: SV/Verilog only, only when the parse errored, only for
+ * declaration keywords that must open a line. The recovered node carries the
+ * same qualified_name the parser would have produced, so anything keyed on qn
+ * attaches exactly as if the parse had succeeded; it simply has no body, so no
+ * members or calls come with it. Better a declaration with no body than a file
+ * that silently contributes nothing. */
+typedef struct {
+    const char *keyword;
+    int keyword_len;
+    const char *label;
+} CBMSvRecoverKind;
+
+static bool sv_ident_char(char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' ||
+           c == '$';
+}
+
+static void cbm_recover_sv_declarations(CBMExtractCtx *ctx) {
+    static const CBMSvRecoverKind kinds[] = {
+        /* "Module" is cbm's file/namespace container, so an SV module is a Class —
+         * the mapping the parsed path already uses (class_label_for_kind). */
+        {"module", 6, "Class"},
+        {"interface", 9, "Interface"},
+        {"package", 7, "Package"},
+        {"program", 7, "Class"},
+    };
+    const char *src = ctx->source;
+    const int len = ctx->source_len;
+    if (!src || len <= 0) {
+        return;
+    }
+    CBMArena *a = ctx->arena;
+    int line = 1;
+    int i = 0;
+    bool in_block_comment = false;
+    int recovered = 0;
+
+    while (i < len) {
+        int ls = i;
+        while (ls < len && (src[ls] == ' ' || src[ls] == '\t')) {
+            ls++;
+        }
+        int line_end = ls;
+        while (line_end < len && src[line_end] != '\n') {
+            line_end++;
+        }
+
+        if (in_block_comment) {
+            for (int p = ls; p + 1 < line_end; p++) {
+                if (src[p] == '*' && src[p + 1] == '/') {
+                    in_block_comment = false;
+                    break;
+                }
+            }
+        } else if (ls < line_end &&
+                   !(src[ls] == '/' && ls + 1 < len && (src[ls + 1] == '/' || src[ls + 1] == '*'))) {
+            for (size_t k = 0; k < sizeof(kinds) / sizeof(kinds[0]); k++) {
+                const CBMSvRecoverKind *kind = &kinds[k];
+                if (line_end - ls <= kind->keyword_len ||
+                    strncmp(src + ls, kind->keyword, (size_t)kind->keyword_len) != 0) {
+                    continue;
+                }
+                int p = ls + kind->keyword_len;
+                if (p < len && sv_ident_char(src[p])) {
+                    continue; /* "modulename" — not the keyword */
+                }
+                while (p < line_end && (src[p] == ' ' || src[p] == '\t')) {
+                    p++;
+                }
+                int ns = p;
+                while (p < line_end && sv_ident_char(src[p])) {
+                    p++;
+                }
+                if (p == ns) {
+                    break; /* `module;` or a line break before the name */
+                }
+                CBMDefinition def;
+                memset(&def, 0, sizeof(def));
+                def.name = cbm_arena_strndup(a, src + ns, (size_t)(p - ns));
+                def.qualified_name = cbm_fqn_compute(a, ctx->project, ctx->rel_path, def.name);
+                def.label = kind->label;
+                def.file_path = ctx->rel_path;
+                def.start_line = line;
+                def.end_line = line;
+                def.is_exported = true;
+                def.is_test = ctx->result->is_test_file;
+                cbm_defs_push(&ctx->result->defs, a, def);
+                recovered++;
+                break;
+            }
+        }
+        if (!in_block_comment) {
+            for (int p = ls; p + 1 < line_end; p++) {
+                if (src[p] == '/' && src[p + 1] == '/') {
+                    break;
+                }
+                if (src[p] == '/' && src[p + 1] == '*') {
+                    in_block_comment = true;
+                    for (int q = p + 2; q + 1 < line_end; q++) {
+                        if (src[q] == '*' && src[q + 1] == '/') {
+                            in_block_comment = false;
+                            break;
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        i = line_end + 1;
+        line++;
+    }
+    if (recovered > 0) {
+        char count_buf[16];
+        snprintf(count_buf, sizeof(count_buf), "%d", recovered);
+        cbm_log_info("extract.sv_recovered", "file", ctx->rel_path, "declarations", count_buf);
+    }
+}
+
+/* True when the tree yielded no SV declaration node, i.e. everything below the
+ * file container was lost to the error. */
+static bool sv_declarations_missing(const CBMExtractCtx *ctx) {
+    for (int i = 0; i < ctx->result->defs.count; i++) {
+        const char *label = ctx->result->defs.items[i].label;
+        if (!label) {
+            continue;
+        }
+        if (strcmp(label, "Class") == 0 || strcmp(label, "Interface") == 0 ||
+            strcmp(label, "Package") == 0 || strcmp(label, "Struct") == 0 ||
+            strcmp(label, "Enum") == 0 || strcmp(label, "Type") == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void cbm_extract_definitions(CBMExtractCtx *ctx) {
     const CBMLangSpec *spec = cbm_lang_spec(ctx->language);
     if (!spec) {
@@ -6895,5 +7042,11 @@ void cbm_extract_definitions(CBMExtractCtx *ctx) {
     // extract_sv_parameters) — the generic passes above cannot reach them.
     if (ctx->language == CBM_LANG_SYSTEMVERILOG || ctx->language == CBM_LANG_VERILOG) {
         extract_sv_parameters(ctx, ctx->root);
+        /* Last resort, and only when the parse actually lost everything: see
+         * cbm_recover_sv_declarations. Gated on ts_node_has_error so a clean
+         * parse never pays for the scan and can never gain a duplicate node. */
+        if (ts_node_has_error(ctx->root) && sv_declarations_missing(ctx)) {
+            cbm_recover_sv_declarations(ctx);
+        }
     }
 }

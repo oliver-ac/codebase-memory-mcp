@@ -365,6 +365,106 @@ TEST(grammar_regression_all) {
     PASS();
 }
 
+/* The SV grammar cannot parse a call inside a packed dimension — `[$clog2(W)-1:0]`
+ * and `[get_width(W)-1:0]` both produce ERROR nodes. That idiom is pervasive in
+ * real RTL, and past some density of such errors tree-sitter stops reducing
+ * `module … endmodule` at all: the whole file becomes one ERROR and the module
+ * declaration disappears. Measured on a 947-file design, that cost ~228 modules
+ * along with their params, types and functions.
+ *
+ * cbm_recover_sv_declarations backstops that with a text scan. These pin it from
+ * both sides: the construct still errors (so the day the grammar learns it, the
+ * first assert is what tells us), and the declaration is present regardless. */
+TEST(sv_module_survives_unparsable_packed_dimension) {
+    const char *src = "module widget\n"
+                      "  import core_pkg::*;\n"
+                      "(\n"
+                      "  input logic clk\n"
+                      ");\n"
+                      "  logic [$clog2(DEPTH)-1:0] rd_ptr;\n"
+                      "  logic [get_counter_width(WIDTH)-1:0] count;\n"
+                      "endmodule\n";
+    CBMFileResult *r = extract(src, CBM_LANG_VERILOG, "reg", "widget.sv");
+    ASSERT_NOT_NULL(r);
+    /* The premise: this really is a file the grammar stumbles on. (has_error
+     * means the parse produced no tree at all; ERROR *nodes* inside a tree are
+     * parse_incomplete.) */
+    ASSERT_TRUE(r->parse_incomplete);
+    /* The guarantee: the module reaches the graph anyway. */
+    int found = reg_has_def_any(r, "widget");
+    cbm_free_result(r);
+    ASSERT_TRUE(found);
+    PASS();
+}
+
+TEST(sv_recovery_finds_every_declaration_kind) {
+    const char *src = "package cfg_pkg;\n"
+                      "  logic [$clog2(N)-1:0] idx;\n"
+                      "endpackage\n"
+                      "\n"
+                      "interface bus_if;\n"
+                      "  logic [$clog2(N)-1:0] addr;\n"
+                      "endinterface\n"
+                      "\n"
+                      "module top;\n"
+                      "  logic [$clog2(N)-1:0] c;\n"
+                      "endmodule\n";
+    CBMFileResult *r = extract(src, CBM_LANG_VERILOG, "reg", "multi.sv");
+    ASSERT_NOT_NULL(r);
+    ASSERT_TRUE(r->parse_incomplete);
+    int pkg = reg_has_def_any(r, "cfg_pkg");
+    int iface = reg_has_def_any(r, "bus_if");
+    int mod = reg_has_def_any(r, "top");
+    cbm_free_result(r);
+    ASSERT_TRUE(pkg);
+    ASSERT_TRUE(iface);
+    ASSERT_TRUE(mod);
+    PASS();
+}
+
+/* Recovery must not invent nodes when the parse succeeded, and must not be fooled
+ * by the keyword appearing in prose or inside a longer identifier. */
+TEST(sv_recovery_does_not_duplicate_or_false_positive) {
+    const char *clean = "module counter(input clk);\n"
+                        "  reg [7:0] q;\n"
+                        "endmodule\n";
+    CBMFileResult *r = extract(clean, CBM_LANG_VERILOG, "reg", "clean.sv");
+    ASSERT_NOT_NULL(r);
+    int counter_defs = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        if (r->defs.items[i].name && strcmp(r->defs.items[i].name, "counter") == 0) {
+            counter_defs++;
+        }
+    }
+    cbm_free_result(r);
+    /* Exactly one — a clean parse must never gain a recovered duplicate. */
+    ASSERT_EQ(counter_defs, 1);
+
+    const char *decoys = "// this module is documented here\n"
+                         "/* module in_a_block_comment */\n"
+                         "package p;\n"
+                         "  logic [$clog2(N)-1:0] modulename;\n"
+                         "endpackage\n";
+    CBMFileResult *r2 = extract(decoys, CBM_LANG_VERILOG, "reg", "decoys.sv");
+    ASSERT_NOT_NULL(r2);
+    int decoy_hits = 0;
+    for (int i = 0; i < r2->defs.count; i++) {
+        const char *n = r2->defs.items[i].name;
+        if (n && (strcmp(n, "is") == 0 || strcmp(n, "in_a_block_comment") == 0 ||
+                  strcmp(n, "modulename") == 0)) {
+            decoy_hits++;
+        }
+    }
+    int pkg_found = reg_has_def_any(r2, "p");
+    cbm_free_result(r2);
+    ASSERT_EQ(decoy_hits, 0);
+    ASSERT_TRUE(pkg_found);
+    PASS();
+}
+
 void suite_grammar_regression(void) {
     RUN_TEST(grammar_regression_all);
+    RUN_TEST(sv_module_survives_unparsable_packed_dimension);
+    RUN_TEST(sv_recovery_finds_every_declaration_kind);
+    RUN_TEST(sv_recovery_does_not_duplicate_or_false_positive);
 }
